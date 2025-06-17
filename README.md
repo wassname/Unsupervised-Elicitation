@@ -39,6 +39,10 @@ ARG_ORG=None
 API_KEY=None
 ```
 
+### Data Preparation
+
+Download data from this [link](https://drive.google.com/file/d/1AJdFJO9IHfOnWHyIlGvInyndLu6EvcfV/view?usp=sharing).
+Put it under the `data/` directory.
 
 ## Run
 
