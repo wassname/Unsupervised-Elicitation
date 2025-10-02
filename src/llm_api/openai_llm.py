@@ -22,7 +22,6 @@ from core.llm_api.base_llm import (
     PRINT_COLORS,
     LLMResponse,
     ModelAPIProtocol,
-    messages_to_single_prompt,
 )
 
 OAIChatPrompt = list[dict[str, str]]

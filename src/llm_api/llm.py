@@ -9,7 +9,6 @@ from typing import Callable, Literal, Optional, Union
 
 import attrs
 
-from core.llm_api.anthropic_llm import ANTHROPIC_MODELS, AnthropicChatModel
 from core.llm_api.base_llm import LLMResponse, ModelAPIProtocol
 from core.llm_api.openai_llm import (
     BASE_MODELS,
@@ -19,14 +18,13 @@ from core.llm_api.openai_llm import (
     OpenAIBaseModel,
     OpenAIChatModel,
 )
-from core.utils import load_secrets
+from unsupervised_elicitation.utils import load_secrets
 
 LOGGER = logging.getLogger(__name__)
 
 
 @attrs.define()
 class ModelAPI:
-    anthropic_num_threads: int = 2  # current redwood limit is 5
     openai_fraction_rate_limit: float = attrs.field(
         default=0.99, validator=attrs.validators.lt(1)
     )
@@ -36,7 +34,6 @@ class ModelAPI:
     _openai_base: OpenAIBaseModel = attrs.field(init=False)
     _openai_base_arg: OpenAIBaseModel = attrs.field(init=False)
     _openai_chat: OpenAIChatModel = attrs.field(init=False)
-    _anthropic_chat: AnthropicChatModel = attrs.field(init=False)
 
     running_cost: float = attrs.field(init=False, default=0)
     model_timings: dict[str, list[float]] = attrs.field(init=False, default={})
@@ -59,10 +56,6 @@ class ModelAPI:
         self._openai_chat = OpenAIChatModel(
             frac_rate_limit=self.openai_fraction_rate_limit,
             organization=secrets[self.organization],
-            print_prompt_and_response=self.print_prompt_and_response,
-        )
-        self._anthropic_chat = AnthropicChatModel(
-            num_threads=self.anthropic_num_threads,
             print_prompt_and_response=self.print_prompt_and_response,
         )
         Path("./prompt_history").mkdir(exist_ok=True)
@@ -130,11 +123,9 @@ class ModelAPI:
         Args:
             model_ids: The model(s) to call. If multiple models are specified, the output will be sampled from the
                 cheapest model that has capacity. All models must be from the same class (e.g. OpenAI Base,
-                OpenAI Chat, or Anthropic Chat). Anthropic chat will error if multiple models are passed in.
-                Passing in multiple models could speed up the response time if one of the models is overloaded.
+                OpenAI Chat).
             prompt: The prompt to send to the model(s). Type should match what's expected by the model(s).
-            max_tokens: The maximum number of tokens to request from the API (argument added to
-                standardize the Anthropic and OpenAI APIs, which have different names for this).
+            max_tokens: The maximum number of tokens to request from the API
             print_prompt_and_response: Whether to print the prompt and response to stdout.
             n: The number of completions to request.
             max_attempts_per_api_call: Passed to the underlying API call. If the API call fails (e.g. because the
@@ -162,8 +153,6 @@ class ModelAPI:
                 return self._openai_base
             elif model_id in GPT_CHAT_MODELS or "ft:gpt-3.5-turbo" in model_id:
                 return self._openai_chat
-            elif model_id in ANTHROPIC_MODELS:
-                return self._anthropic_chat
             raise ValueError(f"Invalid model id: {model_id}")
 
         model_classes = [model_id_to_class(model_id) for model_id in model_ids]
@@ -179,10 +168,7 @@ class ModelAPI:
             kwargs.get("max_tokens") if kwargs.get("max_tokens") is not None else 2000
         )
         model_class = model_classes[0]
-        if isinstance(model_class, AnthropicChatModel):
-            kwargs["max_tokens_to_sample"] = max_tokens
-        else:
-            kwargs["max_tokens"] = max_tokens
+        kwargs["max_tokens"] = max_tokens
         # Check if current prompt has already been saved in the save file
         # If so, directly return previous result
         responses = None
@@ -197,32 +183,14 @@ class ModelAPI:
         # This is because we may frequently update the parse_fn during development
         if responses is None:
             num_candidates = num_candidates_per_completion * n
-            if isinstance(model_class, AnthropicChatModel):
-                responses = list(
-                    chain.from_iterable(
-                        await asyncio.gather(
-                            *[
-                                model_class(
-                                    model_ids,
-                                    prompt,
-                                    print_prompt_and_response,
-                                    max_attempts_per_api_call,
-                                    **kwargs,
-                                )
-                                for _ in range(num_candidates)
-                            ]
-                        )
-                    )
-                )
-            else:
-                responses = await model_class(
-                    model_ids,
-                    prompt,
-                    print_prompt_and_response,
-                    max_attempts_per_api_call,
-                    n=num_candidates,
-                    **kwargs,
-                )
+            responses = await model_class(
+                model_ids,
+                prompt,
+                print_prompt_and_response,
+                max_attempts_per_api_call,
+                n=num_candidates,
+                **kwargs,
+            )
 
         modified_responses = []
         for response in responses:
@@ -257,18 +225,8 @@ class ModelAPI:
 
 
 async def demo():
-    model_api = ModelAPI(anthropic_num_threads=2, openai_fraction_rate_limit=0.99)
-    anthropic_requests = [
-        model_api(
-            "claude-3-5-sonnet-20240620",
-            [
-                {"role": "system", "content": "You are Claude."},
-                {"role": "user", "content": "who are you!"},
-            ],
-            max_tokens=20,
-            print_prompt_and_response=False,
-        )
-    ]
+    model_api = ModelAPI(openai_fraction_rate_limit=0.99)
+
     oai_chat_messages = [
         [
             {"role": "system", "content": "You are gpt-3.5-turbo."},
@@ -293,7 +251,7 @@ async def demo():
         )
         for message in oai_chat_messages
     ]
-    answer = await asyncio.gather(*anthropic_requests, *oai_chat_requests)
+    answer = await asyncio.gather(*oai_chat_requests)
 
     for responses in answer:
         for i in responses:

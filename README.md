@@ -1,3 +1,11 @@
+Fork to
+- [ ] add moral datasets e.g. daily dilemmas, ETHICS, Machiavelli, moral foundations vignettes
+- [ ] refactor to UV and simplify
+- [ ] replicate
+
+
+Original readme
+----
 ## Unsupervised Elicitation of Language Models
 
 We introduce a new unsupervised algorithm for eliciting skills from pretrained language models. This algorithm is competitive with training on human labels on common misconceptions (TruthfulQA), math (GSM8k-verification), and helpfulness reward modeling (Alpaca). Without supervision, we train a helpful chat assistant from the Haiku 3.5 base model that outperforms a similarly trained human-supervised baseline.

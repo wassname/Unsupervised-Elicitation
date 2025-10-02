@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Protocol
 
 import attrs
 import numpy as np
-from anthropic import AI_PROMPT, HUMAN_PROMPT
+# from anthropic import AI_PROMPT, HUMAN_PROMPT
 from pydantic import BaseModel
 
 PRINT_COLORS = {"user": "cyan", "system": "magenta", "assistant": "light_green"}

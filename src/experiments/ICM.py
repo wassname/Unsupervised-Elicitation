@@ -11,7 +11,7 @@ from datasets import load_dataset
 import argparse
 
 from core.llm_api.llm import ModelAPI
-from core.utils import setup_environment
+from unsupervised_elicitation.utils import setup_environment
 from src.experiments.ICM_tools import (
     propose_consistencyfix,
     run_consistencyfix,
