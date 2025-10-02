@@ -14,7 +14,7 @@ import os, sys
 from dataclasses import dataclass
 import dotenv
 from loguru import logger
-from openrouter_wrapper.logprobs import openrouter_completion_wlogprobs, get_logprobs_choices  # User's wrapper
+from openrouter_wrapper.logprobs import openrouter_completion_wlogprobs, get_logprobs_choices, LogprobsNotSupportedError  # User's wrapper
 from typing import List
 
 dotenv.load_dotenv()
@@ -24,7 +24,6 @@ logger.remove()
 logger.add(sys.stderr, format="{time} | {level} | {message}", colorize=True)
 
 # %% [code]
-from dataclasses import field
 
 @dataclass
 class Config:
@@ -49,14 +48,14 @@ C = Config(
     provider_whitelist=[ 'Chutes','Nebius',],
 )
 
-C = Config(
-    model="meta-llama/llama-3.1-70b-instruct",
-    provider_whitelist=[ 'Cerebras','Nebius',],
-)
-C = Config(
-    model="meta-llama/llama-3.1-8b-instruct",
-    provider_whitelist=[ 'Cerebras','Nebius',],
-)
+# C = Config(
+#     model="meta-llama/llama-3.1-70b-instruct",
+#     provider_whitelist=[ 'Cerebras','Nebius',],
+# )
+# C = Config(
+#     model="meta-llama/llama-3.1-8b-instruct",
+#     provider_whitelist=[ 'Cerebras','Nebius',],
+# )
 
 # quick test of logprob
 messages = [{'role': 'user',
@@ -96,8 +95,8 @@ for idx, item in enumerate(dataset):
     }
     data.append(example)
 
-# Limit to small batch for demo (e.g., 64 items)
-data = data[:64]
+# HACK: Limit to small batch for demo
+data = data[:128]
 logger.info(f"Loaded {len(data)} examples from TruthfulQA-bool")
 
 # %% [code]
@@ -118,7 +117,10 @@ logger.info("Initialized labels: {}", {k: v['label'] for k, v in demonstrations.
 # %% [code]
 # Predict label using in-context prompting (placeholder with OpenAI)
 
+prediction_count = 0  # Global counter for first 3 logs
+
 def predict_label(example_uid, current_demos, config=C):
+    global prediction_count
     # Refined few-shot prompt based on get_judge_prompt_fewshot
     # Sort by consistency_key for relevance, limit to 8
     relevant_demos = sorted(
@@ -139,15 +141,23 @@ def predict_label(example_uid, current_demos, config=C):
     
     try:
         # Use wrapper for chat completion (messages format)
-        messages = [{"role": "user", "content": full_prompt}]
+        messages = [{"role": "user", "content": full_prompt}, {"role": "assistant", "content": "Judgment: "}]
         response = openrouter_completion_wlogprobs(
             model_id=config.model,
             provider_whitelist=config.provider_whitelist,
             messages=messages,
-            max_tokens=1,  # Just for "1" or "0"
+            max_tokens=3,  # Allow for "1" or "0"
             temperature=0.0,
             top_logprobs=5,
         )
+        
+        # Debug: Log first 3 prompts and responses
+        if prediction_count < 3:
+            logger.info(f"Debug Prediction {prediction_count + 1} - UID {example_uid}:")
+            logger.info(f"Target Prompt: {target_prompt}")
+            logger.info(f"Response Content: {response['choices'][0]['message']['content']}")
+            logger.info(f"--- End Debug ---")
+            prediction_count += 1
         # Use wrapper's get_logprobs_choices for score
         choice_logp, all_logp = get_logprobs_choices(response, ["1", "0"])
         score = choice_logp["1"] - choice_logp["0"]
@@ -156,24 +166,24 @@ def predict_label(example_uid, current_demos, config=C):
         # If no logprobs, fallback to text
         if response['choices'][0]['logprobs'] is None:
             text = response['choices'][0]['message']['content'].strip()
-            predicted = 1 if "1" in text or "true" in text.lower() else 0
+            
+            if "0" in text or "false" in text.lower():
+                predicted = 0
+            elif "1" in text or "true" in text.lower():
+                predicted = 1
+            else:
+                predicted = np.nan
+                logger.error(f"Unclear prediction text: {text}")
             score = 0.0
             logger.warning("No logprobs, using text fallback")
         
         logger.info(f"Prediction for UID {example_uid}: {predicted}, score: {score:.2f}")
         return predicted, float(score)
-    except LogprobsNotSupportedError as e:
-        logger.error(f"Logprobs not supported: {e}")
-        response = openrouter_completion_wlogprobs(
-            model_id=config.model,
-            messages=[{"role": "user", "content": full_prompt}],
-            max_tokens=5,
-            temperature=0.0,
-            # No logprobs
-        )
-        text = response['choices'][0]['message']['content'].strip()
-        predicted = 1 if "1" in text or "true" in text.lower() else 0
-        return predicted, 0.0
+    # except LogprobsNotSupportedError as e:
+    #     logger.error(f"Logprobs not supported: {e}")
+    #     text = response['choices'][0]['message']['content'].strip()
+    #     predicted = 1 if "1" in text or "true" in text.lower() else 0
+    #     return predicted, 0.0
     except Exception as e:
         logger.error(f"API error: {e}")
         return random.choice([0, 1]), 0.0  # Fallback
@@ -184,32 +194,101 @@ test_pred, test_score = predict_label(0, current_labeled, C)
 logger.info(f"Test prediction: {test_pred}, score: {test_score}")
 
 # %% [code]
-# Simplified inconsistency fix: Ensure per group at most one 'True' for differing keys
-def fix_inconsistencies(demos):
-    # Group by consistency_id
-    groups = {}
-    for uid, demo in demos.items():
-        cid = demo['consistency_id']
-        if cid not in groups:
-            groups[cid] = []
-        groups[cid].append(uid)
-    
+# Enhanced inconsistency fix: Multi-iter LLM proposals for contradictions/implications (inspired by ICM_tools.py)
+# FIXME: Current basic heuristic; uses LLM for decision prompts on inconsistent pairs, simulates outcomes, iterates to resolve
+async def fix_inconsistencies(demos, config=C, max_iters=3):
     updated = False
-    for cid, uids in groups.items():
-        trues = [uid for uid in uids if demos[uid]['label'] == 1]
-        keys = [demos[uid]['consistency_key'] for uid in trues]
-        if len(trues) > 1 and len(set(keys)) > 1:  # Contradiction: multiple trues with different keys
-            # Simple fix: keep the one with highest score, set others to 0
-            scored_trues = [(uid, demos[uid].get('score', 0)) for uid in trues]
-            best_uid = max(scored_trues, key=lambda x: x[1])[0]
-            for uid in trues:
-                if uid != best_uid:
-                    demos[uid]['label'] = 0
-                    updated = True
+    for iteration in range(max_iters):
+        # Group by consistency_id
+        groups = {}
+        for uid, demo in demos.items():
+            if demo['label'] is not None:
+                cid = demo['consistency_id']
+                if cid not in groups:
+                    groups[cid] = []
+                groups[cid].append(uid)
+        
+        fixes_made = False
+        for cid, uids in groups.items():
+            labeled_uids = [uid for uid in uids if demos[uid]['label'] is not None]
+            if len(labeled_uids) < 2:
+                continue  # Need at least two labeled for conflict
+            
+            # Find inconsistent pairs (contradiction or implication)
+            pairs = []
+            labels = {uid: demos[uid]['label'] for uid in labeled_uids}
+            keys = {uid: demos[uid]['consistency_key'] for uid in labeled_uids}
+            for i, uid1 in enumerate(labeled_uids):
+                for uid2 in labeled_uids[i+1:]:
+                    label1, label2 = labels[uid1], labels[uid2]
+                    key1, key2 = keys[uid1], keys[uid2]
+                    if key1 != key2 and ((label1 == label2 == 1) or (label1 == label2 == 0 and key1 in ['A>B', 'B>A'])):
+                        pairs.append((uid1, uid2, "contradiction"))
+                    elif key1 == key2 and label1 != label2:
+                        pairs.append((uid1, uid2, "implication"))
+            
+            if not pairs:
+                continue
+            
+            # For each pair, use LLM to propose resolution
+            for uid1, uid2, pair_type in pairs:
+                claim1 = demos[uid1]
+                claim2 = demos[uid2]
+                
+                # Decision prompt (adapted from get_decision_prompt)
+                decision_prompt = f"""Resolve inconsistency between two claims:
+Claim 1: {claim1['prompt'][:-1]} {claim1['label']}
+Claim 2: {claim2['prompt'][:-1]} {claim2['label']}
+Type: {pair_type}
+
+If contradiction, decide which to set True (1) and False (0).
+If implication, decide if both True or both False.
+Respond with 1 if keep Claim1 True and Claim2 False, or 0 otherwise."""
+
+                try:
+                    messages = [{"role": "user", "content": decision_prompt}]
+                    response = openrouter_completion_wlogprobs(
+                        model_id=config.model,
+                        provider_whitelist=config.provider_whitelist,
+                        messages=messages,
+                        max_tokens=1,
+                        temperature=0.0,
+                        top_logprobs=5,
+                    )
+                    choice_logp = get_logprobs_choices(response, ["1", "0"])[0]
+                    decision_score = choice_logp["1"] - choice_logp["0"]
+                    decision = 1 if decision_score > 0 else 0
+                except:
+                    decision = 0  # Fallback; prefer Claim1
+                    
+                # Apply decision
+                if pair_type == "contradiction":
+                    if decision == 1:
+                        demos[uid1]['label'] = 1
+                        demos[uid2]['label'] = 0
+                    else:
+                        demos[uid1]['label'] = 0
+                        demos[uid2]['label'] = 1
+                else:  # implication
+                    if decision == 1:
+                        demos[uid1]['label'] = 1
+                        demos[uid2]['label'] = 1
+                    else:
+                        demos[uid1]['label'] = 0
+                        demos[uid2]['label'] = 0
+                
+                fixes_made = True
+                updated = True
+        
+        if not fixes_made:
+            break  # No more fixes needed in this iteration
+    
     return demos, updated
 
-# Test fix
-temp_demos, updated = fix_inconsistencies(demonstrations.copy())
+# Test fix (now async, so await)
+import asyncio
+temp_demos = demonstrations.copy()
+temp_demos, updated = asyncio.run(fix_inconsistencies(temp_demos, C))
 logger.info(f"Fixed inconsistencies: {updated}")
 
 # %% [code]
@@ -247,7 +326,7 @@ logger.info("Initial energy: {}", compute_energy(demonstrations))
 
 # %% [code]
 # Main simulated annealing loop
-def run_icm(demonstrations, config=C):
+async def run_icm(demonstrations, config=C):
     energies = []
     accuracies = []
     current_labeled = {k: v for k, v in demonstrations.items() if v['label'] is not None}
@@ -297,7 +376,7 @@ def run_icm(demonstrations, config=C):
         temp_demos = demonstrations.copy()
         temp_demos[example_uid]['label'] = new_label
         temp_demos[example_uid]['score'] = score
-        temp_demos, _ = fix_inconsistencies(temp_demos)
+        temp_demos, _ = await fix_inconsistencies(temp_demos, config=config)
         
         # Compute new energy
         new_energy, new_metrics = compute_energy(temp_demos, config)
@@ -319,16 +398,20 @@ def run_icm(demonstrations, config=C):
         if iter % 10 == 0:
             logger.info("Progress: Labeled {}, Inconsistents: {}", new_metrics['num_labeled'], new_metrics['num_inconsistent'])
     
+    # Final async fix if needed
+    demonstrations, _ = await fix_inconsistencies(demonstrations, config=config)
+    
     return demonstrations, energies, accuracies
 
 # %% [code]
 # Run the algorithm
-final_demos, energies, accuracies = run_icm(demonstrations, C)
+final_demos, energies, accuracies = asyncio.run(run_icm(demonstrations, C))
 
 # Final metrics
 final_energy, final_metrics = compute_energy(final_demos, C)
 logger.info("\nFinal Results:")
 logger.info("Energy: {:.2f}", final_energy)
+# TODO show vanilla accuracy here for comparison
 logger.info("Accuracy vs vanilla: {:.2f}", final_metrics['accuracy'])
 logger.info("Labeled: {}/{}", final_metrics['num_labeled'], len(data))
 logger.info("Inconsistencies: {}", final_metrics['num_inconsistent'])
@@ -358,6 +441,7 @@ plt.xlabel('Iteration')
 plt.ylabel('Accuracy')
 
 plt.tight_layout()
+plt.savefig("icm_progress.png")
 plt.show()
 
 # %% [markdown]
@@ -365,7 +449,9 @@ plt.show()
 # - [x] Load larger HuggingFace dataset ('Yik/truthfulQA-bool' subset, formatted to messages).
 # - [x] Refine few-shot prompt from original get_judge_prompt_fewshot.
 # - [x] Add weighted sampling for inconsistent groups (no longer random).
-# - FIXME: Implement async calls for batch efficiency (currently sync).
-# - FIXME: 
-# th logprobs-supported models.
-
+# - [ ] Implement async batch predictions in predict_label (use asyncio.gather for concurrent API calls, inspired by pipeline.py)
+# - [ ] Enhance fix_inconsistencies with multi-iter LLM proposals (use LLM decisions for contradictions/implications, from ICM_tools.py)
+#    - it's marked as "basic" because it directly applies LLM decisions without deeper simulation or multiple proposals.
+#    - in the original ICM.py the LLM generates multiple resolution proposals for inconsistencies, simulates their outcomes (e.g., by temporarily applying them and evaluating metrics like energy), and iterates to select the best one. https://github.com/Jiaxin-Wen/Unsupervised-Elicitation/blob/master/src/experiments/ICM.py
+# - [ ] Add caching for predictions (dict/file-based, like save_to_cache in pipeline.py)
+# - [ ] Expand metrics in compute_energy (add label distributions, detailed inconsistent_num, from ICM.py)

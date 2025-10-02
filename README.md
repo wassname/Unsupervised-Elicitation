@@ -1,14 +1,14 @@
 Fork to
-- [ ] add moral datasets e.g. daily dilemmas, ETHICS, Machiavelli, moral foundations vignettes
 - [x] refactor to UV
-- [ ]  and simplify
-- [ ] replicate
+- [x]  and simplify
+- [x] replicate ![](docs/icm_progress.png)
+- [ ] add moral datasets e.g. daily dilemmas, ETHICS, Machiavelli, moral foundations vignettes
 
 
 Usage
 ```py
 uv sync
-uv run src/experiments/ICM.py -- --testbed truthfulQA --alpha 50
+uv run nbs/simple_icm.py
 ```
 
 
