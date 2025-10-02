@@ -1,7 +1,15 @@
 Fork to
 - [ ] add moral datasets e.g. daily dilemmas, ETHICS, Machiavelli, moral foundations vignettes
-- [ ] refactor to UV and simplify
+- [x] refactor to UV
+- [ ]  and simplify
 - [ ] replicate
+
+
+Usage
+```py
+uv sync
+uv run src/experiments/ICM.py -- --testbed truthfulQA --alpha 50
+```
 
 
 Original readme
