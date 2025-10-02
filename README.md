@@ -1,5 +1,6 @@
 Fork to
 - [x] refactor to UV
+- [x] use openrouter logprob moddels
 - [x]  and simplify
 - [x] replicate ![](docs/icm_progress.png)
 - [ ] add moral datasets e.g. daily dilemmas, ETHICS, Machiavelli, moral foundations vignettes
@@ -7,6 +8,7 @@ Fork to
 
 Usage
 ```py
+# make sure you OPENROUTER_API_KEY is set in your .env file
 uv sync
 uv run nbs/simple_icm.py
 ```
