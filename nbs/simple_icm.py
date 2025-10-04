@@ -38,7 +38,7 @@ dotenv.load_dotenv()
 
 # Setup loguru
 logger.remove()
-logger.add(sys.stderr, format="{time} | {level} | {message}", colorize=True, level="INFO")
+logger.add(sys.stderr, format="<green>{time:YYYY-MM-DD HH:mm}</green> | <level>{level}</level> | <cyan>{message}</cyan>", colorize=True, level="DEBUG")
 
 # %% [code]
 
@@ -51,29 +51,25 @@ class Config:
     beta: float = 2.0
     num_seed: int = 8
     max_iters: int = 950  # Small for demo; increase for more
-    n_shots: int = 16  # Number of in-context examples
+    n_shots: int = 8  # Number of in-context examples
     model_id: str = "meta-llama/llama-3.1-8b-instruct"  # Logprobs supported
     provider_whitelist: Tuple[str] = None  # None to let OpenRouter choose
     out_dir: Path = Path("../outputs/icm")  # Directory to save outputs
-    log_interval: int = 50  # Log progress every N iterations
+    log_interval: int = 20  # Log progress every N iterations
 
 C = Config(
-    model_id="qwen/qwen3-235b-a22b-2507",
+    model_id="qwen/qwen3-235b-a22b-2507", # $0.2 0.6
     provider_whitelist=[ 'Chutes','Nebius',], 
 )
 C.out_dir.mkdir(parents=True, exist_ok=True)
 
 # C = Config(
-#     model_id="qwen/qwen3-30b-a3b-instruct-2507",
+#     model_id="qwen/qwen3-30b-a3b-instruct-2507", # 0.08 $0.33
 #     provider_whitelist=[ 'Chutes','Nebius',],
 # )
 
 # C = Config(
-#     model_id="meta-llama/llama-3.1-70b-instruct",
-#     provider_whitelist=[ 'Cerebras','Nebius',],
-# )
-# C = Config(
-#     model_id="meta-llama/llama-3.1-8b-instruct",
+#     model_id="meta-llama/llama-3.1-8b-instruct", # 0.02 0.03
 #     provider_whitelist=('Cerebras','Nebius',),
 # )
 
@@ -90,7 +86,7 @@ data = []
 group_id = 0
 groups = {}
 for idx, item in enumerate(dataset):
-    claim = f"Question: {item['Question']}\nClaim: {item['Answer']}\nI think this claim is"
+    claim = f"Question: {item['Question']}\nClaim: {item['Answer']}"
     label = item['label']
     consistency_id = item['question_id']
     
@@ -152,12 +148,12 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False):
     # FIXME to not lead the unsupervised model, we should avoid true/false or even 0/1 and try to use neutral labels like A/B or similar
     for idx, demo in enumerate(relevant_demos):
         label_str = "A" if demo['label'] == 1 else "B"
-        fewshot.append(f"\nCandidate: {demo['prompt']}\nSet: {label_str}\n\n")
+        fewshot.append(f"\nCandidate: {demo['prompt']}\nSet: {label_str}\n")
 
     target_prompt = demonstrations[example_uid]['prompt']
     messages = [
-        {"role": "user", "content": instruction+"".join(fewshot)},
-        {"role": "assistant", "content": f"Candidate: {target_prompt}\n"} # Assistant prefill to ensure 
+        {"role": "user", "content": instruction+"".join(fewshot)+f"Candidate: {target_prompt}\n"},
+        {"role": "assistant", "content": "\n\nSet:"} # Assistant prefill to ensure 
     ]
     
 
@@ -177,16 +173,22 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False):
         logger.info(f"--- End Debug ---")
         
     try:
-        choice_logp, all_logp = get_logprobs_choices(response, ["A", "B"])
-        probmass = np.exp(np.array(list(choice_logp.values()))).sum()
-        if probmass < 0.5:
+        choice_strs = ["A", "B"]
+        choice_logp, top_logp = get_logprobs_choices(response, choice_strs, lower=False)
+
+
+        choice_in_toplogp = any([s for s in choice_strs if s in top_logp])
+
+
+        if not choice_in_toplogp:
             model_response = response['choices'][0]['message']['content']
-            logger.warning(f"Low prob mass {probmass:.2f} for UID {example_uid}, may indicate model confusion. Instead we got these top logprobs: {all_logp} and this output: {model_response}")
+            logger.warning(f"Choices not returned for UID {example_uid}, may indicate model confusion. choice_logp={choice_logp}. Instead we got these top logprobs: {top_logp} and \nmessages: {print_messages(messages)}\nthis output: {model_response}")
         score = choice_logp["A"] - choice_logp["B"]
         predicted = 1 if score > 0 else 0
         return predicted, float(score)
     except Exception as e:
-        logger.error(f"API error: {e}")
+        raise e
+        logger.exception(f"API error: {e}")
         return random.choice([0, 1]), 0.0
 
 
@@ -230,7 +232,7 @@ def compute_energy(demos, config=C):
     energy = config.alpha * avg_lprob - num_inconsistent
     accuracy = np.mean([d['label'] == d['vanilla_label'] for d in labeled])
     return energy, {
-        'avg_prob': avg_lprob,
+        'avg_lprob': avg_lprob,
         'num_inconsistent': num_inconsistent,
         'accuracy': accuracy,
         'num_labeled': len(labeled)
@@ -377,7 +379,7 @@ async def run_icm(demonstrations, config=C):
             demonstrations = temp_demos
             old_energy = new_energy
             current_labeled = {k: v for k, v in demonstrations.items() if v['label'] is not None}
-            logger.info("Iter {}: Accepted. Energy: {:.2f}. {}", iter, old_energy, accept_msg)
+            logger.debug("Iter {}: Accepted. Energy: {:.2f}. {}", iter, old_energy, accept_msg)
         else:
             logger.debug("Iter {}: Rejected. {}", iter, accept_msg)
         
