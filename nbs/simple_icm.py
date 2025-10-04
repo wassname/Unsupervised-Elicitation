@@ -52,28 +52,28 @@ class Config:
     num_seed: int = 8
     max_iters: int = 950  # Small for demo; increase for more
     n_shots: int = 16  # Number of in-context examples
-    model: str = "meta-llama/llama-3.1-8b-instruct"  # Logprobs supported
+    model_id: str = "meta-llama/llama-3.1-8b-instruct"  # Logprobs supported
     provider_whitelist: Tuple[str] = None  # None to let OpenRouter choose
     out_dir: Path = Path("../outputs/icm")  # Directory to save outputs
     log_interval: int = 50  # Log progress every N iterations
 
 C = Config(
-    model="qwen/qwen3-235b-a22b-2507",
+    model_id="qwen/qwen3-235b-a22b-2507",
     provider_whitelist=[ 'Chutes','Nebius',], 
 )
 C.out_dir.mkdir(parents=True, exist_ok=True)
 
 # C = Config(
-#     model="qwen/qwen3-30b-a3b-instruct-2507",
+#     model_id="qwen/qwen3-30b-a3b-instruct-2507",
 #     provider_whitelist=[ 'Chutes','Nebius',],
 # )
 
 # C = Config(
-#     model="meta-llama/llama-3.1-70b-instruct",
+#     model_id="meta-llama/llama-3.1-70b-instruct",
 #     provider_whitelist=[ 'Cerebras','Nebius',],
 # )
 # C = Config(
-#     model="meta-llama/llama-3.1-8b-instruct",
+#     model_id="meta-llama/llama-3.1-8b-instruct",
 #     provider_whitelist=('Cerebras','Nebius',),
 # )
 
