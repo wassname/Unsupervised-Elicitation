@@ -1,0 +1,855 @@
+\documentclass{article}
+
+
+% if you need to pass options to natbib, use, e.g.:
+\PassOptionsToPackage{numbers, compress}{natbib}
+% before loading neurips_2025
+
+
+% ready for submission
+% \usepackage{neurips_2025}
+
+
+% to compile a preprint version, e.g., for submission to arXiv, add add the
+% [preprint] option:
+\usepackage[preprint]{neurips_2025}
+
+
+% to compile a camera-ready version, add the [final] option, e.g.:
+%     \usepackage[final]{neurips_2025}
+
+
+% to avoid loading the natbib package, add option nonatbib:
+%    \usepackage[nonatbib]{neurips_2025}
+
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{subcaption}     % for subfigures
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{amsmath}
+\usepackage{enumitem}
+\usepackage{graphicx} 
+\usepackage{xspace}
+\usepackage{wrapfig}
+\newcommand{\ourmethod}[0]{\textsc{ICM}\xspace}
+
+\definecolor{color5}{HTML}{006795}
+\hypersetup{
+  colorlinks   = true, %Colours links instead of ugly boxes
+  urlcolor     = color5, %Colour for external hyperlinks
+  linkcolor    = color5, %Colour of internal links
+  citecolor   = color5 %Colour of citations, could be ``red''
+}
+
+\newcommand{\jw}[1]{{\color{magenta}[\textbf{jw:} #1]}}
+\newcommand{\sfeng}[1]{{\color{yellow}[\textbf{sf:} #1]}}
+\newcommand{\ph}[1]{{\color{blue}[\textbf{ph:} #1]}}
+
+\title{Unsupervised Elicitation of Language Models}
+
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to LaTeX to determine where to break the
+% lines. Using \AND forces a line break at that point. So, if LaTeX puts 3 of 4
+% authors names on the first line, and the last on the second line, try using
+% \AND instead of \And before the third author name.
+
+
+\author{Jiaxin Wen$^1$, Zachary Ankner$^1$, Arushi Somani$^1$,
+\\
+\textbf{Peter Hase$^{2}$, Samuel Marks$^1$, Jacob Goldman-Wetzler$^1$, Linda Petrini$^3$, Henry Sleight$^4$}\\
+\textbf{Collin Burns$^1$, He He$^5$, Shi Feng$^{6}$, Ethan Perez$^1$, Jan Leike$^1$}\\
+$^1$Anthropic $^2$Schmidt Sciences $^3$Independent $^4$Constellation\\
+$^5$New York University $^6$George Washington University
+  % \texttt{hippo@cs.cranberry-lemon.edu} \\
+  % examples of more authors
+  % \And
+  % Coauthor \\
+  % Affiliation \\
+  % Address \\
+  % \texttt{email} \\
+  % \AND
+  % Coauthor \\
+  % Affiliation \\
+  % Address \\
+  % \texttt{email} \\
+  % \And
+  % Coauthor \\
+  % Affiliation \\
+  % Address \\
+  % \texttt{email} \\
+  % \And
+  % Coauthor \\
+  % Affiliation \\
+  % Address \\
+  % \texttt{email} \\
+}
+
+
+\begin{document}
+
+
+\maketitle
+
+
+\begin{abstract}
+  To steer pretrained language models for downstream tasks, today's post-training paradigm relies on humans to specify desired behaviors. However, for models with superhuman capabilities, it is difficult or impossible to get high-quality human supervision.
+  To address this challenge, we introduce a new unsupervised algorithm, Internal Coherence Maximization (ICM), to fine-tune pretrained language models on their own generated labels, \emph{without external supervision}.   
+  On GSM8k-verification, TruthfulQA, and Alpaca reward modeling tasks, our method matches the performance of training on golden supervision and outperforms training on crowdsourced human supervision. On tasks where LMs' capabilities are strongly superhuman, our method can elicit those capabilities significantly better than training on human labels. Finally, we show that our method can improve the training of frontier LMs: we use our method to train an unsupervised reward model and use reinforcement learning to train a Claude 3.5 Haiku-based assistant. Both the reward model and the assistant outperform their human-supervised counterparts.
+\end{abstract}
+
+
+\begin{figure*}[!h]
+\vspace{-6mm}
+\vspace{3pt}
+\centering
+\includegraphics[width=0.95\textwidth]{figures/fig1_llama.png}
+\vspace{-4pt}
+\caption{\textbf{Our unsupervised algorithm~(\ourmethod) matches the performance of fine-tuning on golden supervision and outperforms crowdsourced human supervision.} We report average test accuracy and variance across three runs on three classification tasks: mathematical correctness~(GSM8K-verification), common misconceptions~(TruthfulQA), and helpfulness and harmlessness~(Alpaca).} 
+% On these datasets, \ourmethod~(Ours) outperforms zero-shot performance of commercially post-trained chat models (e.g., Llama-3.1-70B-Chat).}
+\label{fig:headline}
+\end{figure*}
+
+
+\section{Introduction}
+
+
+Today's post-training paradigm of pre-trained language models (LMs) still relies on humans to specify desired behaviors, either through demonstrations or preference feedback \citep{ouyang2022training, glaese2022improving, bai2022training}.
+However, as tasks and model behaviors grow more complex, human supervision becomes increasingly unreliable: LMs can learn to mimic mistakes in demonstrations \citep{asare2023github} or exploit flaws in feedback \citep{wen2024language}. How do we train LMs to do tasks that are too difficult for humans to demonstrate or evaluate reliably?
+
+We introduce a new approach to address this problem: we seek to elicit specific concepts or skills from a pretrained model \emph{without any supervision}, thus bypassing the limitations of human supervision. Pretrained models have already learned rich representations about many important human concepts, such as mathematical correctness, truthfulness, and helpfulness~\citep{bubeck2023sparks}. We should not need to teach LMs much about these concepts in post-training---instead, we can just ``elicit'' them from LMs \citep{burns2022discovering}.
+
+Concretely, given a task specified by a set of labeled inputs, our goal is to fine-tune a pretrained model on its own generated labels to perform well on this task, without using any provided labels.
+
+Our algorithm, \textbf{I}nternal \textbf{C}oherence \textbf{M}aximization (\ourmethod), does this by searching for a set of labels that are logically consistent and mutually predictable according to the pretrained model. 
+Specifically, mutual predictability measures how likely the model can infer each label when conditioned on all other labels. This intuitively encourages all labels to reflect a single concept according to the model. Logical consistency further imposes simple constraints, thus blocking superficially predictable label assignments, such as sharing the same label across all data points. Since finding the optimal label set that maximizes this objective is computationally infeasible, \ourmethod uses a search algorithm inspired by simulated annealing \citep{pirlot1996general} to approximately maximize it.
+
+We show that \ourmethod matches the performance of training on golden labels on TruthfulQA~\citep{lin2021truthfulqa} and GSM8K~\citep{gsm8k}, and surpasses training on crowdsourced human labels on Alpaca~\citep{taori2023alpaca}. Additionally, on a task where LMs are strongly superhuman---identifying an author's gender from a writing sample\footnote{We use a widely-adopted academic dataset \citep{schler2006effects} for studying AI fairness \citep{coavoux2018privacy, lyu2020differentially}, which consists of self-reported author information. }---\ourmethod significantly outperforms the human supervision baseline.
+
+Beyond standard benchmarks, we investigate \ourmethod's potential in improving frontier models by training a version of Claude 3.5 Haiku without any human supervision. Specifically, we first use \ourmethod to train an unsupervised reward model (RM), then fine-tune the Claude 3.5 Haiku pretrained model through reinforcement learning. Evaluations on Rewardbench~\citep{lambert2024rewardbench} confirm that our unsupervised RM outperforms its counterparts trained on production-grade high-quality human supervision. Further, when assessed by Claude 3.5 Sonnet’s production-grade RM, our unsupervised assistant policy wins 60\% of head-to-head comparisons against the policy trained with the human-supervised RM.
+
+While prior work has studied unsupervised elicitation methods in simple toy settings \citep{burns2022discovering}, our work demonstrates for the first time that it is possible to exceed human supervision in realistic settings at production scale. By successfully training a Claude 3.5 Haiku-based assistant without any human labels and achieving better performance than its human-supervised counterpart, we demonstrate that unsupervised elicitation is practically useful for post-training frontier models into general assistants.
+
+% Together, our results suggest that unsupervised elicitation is a promising avenue to break the human bottleneck and fully leverage the latent, superhuman capabilities in pre-trained models.
+
+% Specifically, we apply \ourmethod to train an unsupervised reward model (RM). As a baseline, we also use the production-level high-quality human labels to build a human-supervised RM. We then use these two RMs to optimize the Claude 3.5 Haiku pretrained model to create helpful, harmless, and honest assistant chatbots. When using the reward model for training production Claude 3.5 Sonnet as a judge, we find that the assistant trained with our unsupervised RM wins 60\% of the head-to-head comparisons with the counterpart trained on the human-supervised RM.
+% Our experiments are conducted with both Llama~3 (8B and 70B) and Claude pretrained models. 
+% , while ensuring they are sufficiently aligned that humans does not lose control over them.
+
+% Just like how current post-training finetunes the base model using human-defined labels, we finetune the model using model-defined labels, with the hope that the model then generalizes to behave consistently according to what it thinks is good.
+% Surprisingly, the resulting model actually aligns very well with what humans think is good, matching the performance of finetuning on gold labels when they are available, and surpassing models trained with weak human labels---including commercial chat models---when the task is challenging.
+% This confirms our hypothesis and demonstrates that the dependency on human supervision in post-training is in fact unnecessary, and that the base model already has a good underlying representation that's better aligned with humans than we thought---it just needs to be properly elicited.
+%
+
+\section{Methodology} \label{sec:task}
+
+\subsection{Problem Statement} 
+
+
+Typically, fine-tuning LMs for a task requires a labeled dataset $D=\{(x_i, y_i^*)\}$. However, for many complex tasks, obtaining externally human-specified $\{y_i^*\}$ is difficult or impossible. Therefore, our goal is to use the LM to estimate labels $\{y_i\}$, based purely on the inputs $\{x_i\}$. 
+
+In this following section, we explain how an LM can internally score the quality of $\{y_i\}$, without referencing external labels $\{y_i^*\}$, and how to algorithmically maximize this score.
+
+
+\subsection{Scoring Function}
+\label{sec:scoring-function}
+
+
+We measure the quality of the model-generated label set with a scoring function composed of two parts: how likely the model can infer each label when conditioned on all other labels~(``mutual predictability'') and how logically consistent the label set is as a whole.
+
+\textbf{Mutual Predictability.} 
+For each example $x_i$, we calculate the probability of its label $y_i$ by putting all other $N-1$ labels in the context, and sum the log probabilities across all examples: 
+
+$$\mathcal{P}_\theta(D) = \sum_{i=0}^N\log P_\theta(y_i|x_i, D \setminus (x_i, y_i)) $$
+where $P_\theta$ is the pretrained model.
+
+Intuitively, this yields a high score if $\{(x_i, y_i)\}$ collectively specify a single coherent concept for the model --- i.e. a labeling scheme where the model can confidently infer any label $y_i$ from the others.
+% Intuitively, this would yield the highest score if 1) the in-context $N-1$ labels can collectively well specify a single underlying task, and 2) the label $y_i$ obeys the same task. 
+
+
+However, mutual predictability alone allows some degenerate solutions due to artifacts of in-context learning, e.g. assigning the same label to all data points can artificially inflate $P_\theta(D)$ as well.
+
+\textbf{Logical Consistency.} 
+To rule out degenerate solutions when maximizing mutual predictability alone, we further enforce simple logical consistency on the label set. Specifically, we are given a logical consistency function $c(x_i, y_i, x_j, y_j) \in \{ 0, 1 \}$ that checks whether the labels $y_i$ and $y_j$ on data points $x_i$ and $x_j$ are logically consistent with each other. We use it to measure inconsistencies in our labels:
+$$\mathcal{I}(D) = \sum_{i=1}^N \sum_{j=1}^N c(x_i, y_i, x_j, y_j)$$
+
+Determining fine-grained logical consistency between each example is non-trivial; however, empirical evidence suggests that even simple and general logical constraints suffice. For example, when judging mathematical correctness, two solutions to the same math problem cannot be both labeled ``True'' if their final answers are different. Another general, task-agnostic logical constraint that we use for comparative datasets is asymmetry: when comparing two responses $A$ and $B$, two claims ``$A>B$'' and ``$B>A$'' cannot be both labeled ``True''.
+
+
+\textbf{Overall Scoring Function.} Combining the two terms, our scoring function is defined as follows:
+$$U(D) = \alpha \cdot \mathcal{P}_\theta(D) - \mathcal{I}(D)$$
+\label{eq:joint_prob}
+where $\alpha$ is a hyperparameter to balance the strength of mutual predictability and logical consistency.
+
+
+\subsection{Our Algorithm} 
+
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/algorithm.pdf}
+    \caption{\ourmethod optimizes labels for logical consistency and mutual predictability. \textbf{Top}: an illustrative example of mutual predictability scoring. \textbf{Bottom}: the searching process for labeling a new example.}
+    \label{fig:algorithm}
+\end{figure}
+
+Finding the optimal label set that maximizes our scoring function is an integer programming problem, which is computationally infeasible for realistic dataset sizes ($10^3<N<10^6$). \ourmethod thus proposes an efficient approximate algorithm \ref{alg:main}, which is inspired by simulated annealing.
+
+Starting from an empty labeled set, \ourmethod initializes the search process with $K$ randomly labeled examples, then iteratively adds labels, one at a time. To add a label, \ourmethod executes three steps: 1) sample a new example, 2) decide its label while fixing any introduced inconsistencies, and 3) decide whether to accept this new label based on the scoring function. In this way, \ourmethod incrementally expands the label set and improves the score.
+
+
+
+% \begin{wrapfigure}{r}{8.4cm}
+%     \vspace{-7mm}
+%     \begin{minipage}{8.4cm}
+\begin{algorithm}[!t]
+\small
+\caption{Internal Coherence Maximization (\ourmethod)}
+\begin{algorithmic}[1]
+\Require Unlabeled Dataset $D_\text{unlabel}=\{x_i\}$. Labeled Dataset $D=\emptyset$.
+Pretrained model $\theta$. Initial temperature $T_0$. Final temperature $T_{\min}$. Cooling rate $\beta$.
+\Ensure Labeled Dataset $\{x_i, y_i\}$.
+\State Randomly select and label K examples; update $D$. \Comment{Initialization}
+\State $D \leftarrow \texttt{consistencyfix}(D)$ \Comment{Resolve initial inconsistencies via Alg. \ref{alg:consistencyfix}}
+\For{$n=1,\cdots, N$}
+\State $T \leftarrow \max(T_{\min}, \frac{T_0}{1 + \beta \log(n)})$\Comment{Update temperature}
+\State Sample example $x_i \sim \{x_1, \cdots, x_N\}$, \Comment{Input selection}
+\State Assign label $\hat{y_i}=\arg\max\limits_{y\in \mathcal{Y}}P_{\theta}(y_i|x_i, D \setminus \{(x_i, y_i)\})$
+\State Temporarily update  $\hat{D} \leftarrow D \cup \{(x_i, \hat{y_i})\}$
+\State $\hat{D} \leftarrow \texttt{consistencyfix}(\hat{D})$ \Comment{Resolve inconsistencies via Alg. \ref{alg:consistencyfix}}
+\State $\Delta = U(\hat{D}) - U(D)$
+\If {$\Delta > 0$} \Comment{Accept new label}
+\State $D \leftarrow \hat{D}$
+\Else
+\If {random(0,1) $< \exp(\Delta/T)$} \Comment{Reject new label by probability}
+\State $D \leftarrow \hat{D}$ 
+\EndIf
+\EndIf
+\EndFor
+\end{algorithmic}
+\label{alg:main}
+\end{algorithm}
+
+
+
+\textbf{Initialization.} We initialize the searching process with $K$ randomly labeled examples. The choice of $K$ presents a trade-off. A large $K$ (e.g., $K=N$) introduces significant initial noise that hinders subsequent convergence. Our preliminary experiments indicate that initializing all $K=N$ examples with random labels or zero-shot predictions often traps the model in a poor initialization. Conversely, $K=0$ reduces to a zero-shot setting, where the model lacks sufficient context to understand the task and achieves near-random performance. Empirically, we find that a small number (e.g., $K=8$), often strikes a good balance by providing sufficient demonstrations while reducing initial noise \citep{min-etal-2022-rethinking}.
+
+\textbf{Choose a New Example to Label.} At each iteration, we select an example to label, which could be either unlabeled or previously labeled. This allows us to dynamically correct earlier mistakes. To fully leverage logical consistency, unlabeled examples that share consistency relationships with existing labeled ones are prioritized by increasing their sampling weights (e.g., by a factor of 100).
+
+\begin{wrapfigure}{r}{8.5cm}
+    \vspace{-8mm}
+    \begin{minipage}{8.5cm}
+    \begin{algorithm}[H]
+    \small
+    \caption{ConsistencyFix}
+    \begin{algorithmic}[1]
+    \Require Labeled Dataset $D$. 
+    Pretrained model $\theta$. Max iteration M.
+    \Ensure Updated Labeled Dataset $D$.
+    \For{$m=1,\cdots, M$}
+    \If {$\mathcal{I}(D) \neq 0$ }
+    \State Sample an inconsistent pair $(x_i, x_j)$
+    \State Enumerate consistent label options $\{(y_i, y_j)\}$
+    \State $(\hat{y_i}, \hat{y_j}) = \arg\max\limits_{\{(y_i, y_j)\}} U(D \cup \{(x_i, y_i), (x_j, y_j)\})$
+    \If {$U(D \cup \{(x_i, \hat{y_i}), (x_j, \hat{y_j})\})$ > $U(D)$}
+    \State $D \leftarrow D \cup \{(x_i, \hat{y_i}), (x_j, \hat{y_j})\}$
+    \EndIf
+    \EndIf
+    \EndFor
+    \end{algorithmic}
+    \label{alg:consistencyfix}
+    \end{algorithm}
+    \end{minipage}
+    \vspace{-5mm}
+\end{wrapfigure}
+
+
+\textbf{Fix Inconsistencies.} Although $U(D)$ explicitly penalizes logical inconsistencies, simply maximizing $U(D)$ during search still results in substantial label inconsistencies. To mitigate this issue, we actively resolve inconsistencies via Algorithm \ref{alg:consistencyfix}. Specifically, when an inconsistency between a labeled data pair $(x_i, x_j)$ arises, the algorithm checks all consistent label options for them and selects the combination that maximizes $U(D)$. Importantly, after introducing a new label, we first fix its introduced inconsistencies and then measure $U(D)$. Therefore, even if the new correct label contradicts all existing consistently wrong labels, the algorithm would examine and fix the existing incorrect labels first, instead of directly rejecting the new label.
+
+
+\textbf{Accept a New Label.} We directly accept the new label if it improves $U(D)$. Otherwise, inspired by simulated annealing, the algorithm rejects it by a probability decided by two factors:
+% [leftmargin=*, topsep=0pt, itemsep=0pt]
+\begin{itemize} [leftmargin=*, topsep=-1pt, itemsep=-2pt]
+    \item Score Difference $\Delta$:  Larger decreases in $U(D)$ increase the likelihood of rejection.
+    \item Iteration: The rejection likelihood increases over time, making the algorithm increasingly selective.
+\end{itemize}
+
+
+\section{Experiment Setup}
+
+\subsection{Datasets}
+
+\begin{itemize}[leftmargin=*, topsep=0pt, itemsep=0pt]
+    \item \textbf{TruthfulQA (Truthfulness)}: For each question, multiple answer choices are provided in TruthfulQA. The task is to classify each answer choice as correct or incorrect.
+    \item \textbf{GSM8K-verification (Mathematical Correctness)}: For each question, we sample multiple solutions from LMs. The task is to classify each solution as correct or incorrect. To determine golden labels, we evaluate both final answers and intermediate reasoning steps. Specifically, we prompt Claude 3.5 Sonnet to validate intermediate steps against the provided steps in GSM8K.
+    \item \textbf{Alpaca (Helpfulness and Harmlessness)}: For each user query, two assistant responses are provided in Alpaca. The task is to classify which response is more helpful and harmless.
+\end{itemize}
+
+\begin{table}[!t]
+\caption{Dataset examples. We unify the original tasks into classification tasks.}
+\centering
+{
+    \begin{tabular}{p{0.12\linewidth}|p{0.85\linewidth}}
+    \toprule
+    \textbf{Dataset} & \textbf{Example}\\
+    \midrule
+    \textbf{TruthfulQA} & \textbf{Question}: What are some cities that get less rainfall than Boston?\newline
+\textbf{Claim}: San Francisco and Los Angeles get less rainfall than Boston.\newline
+\textbf{I think this Claim is} [True/False]\\
+    \midrule
+    \textbf{GSM8K} & \textbf{Question}: Arnel had ten boxes of pencils with the same number of pencils$\cdots$\newline
+\textbf{Claim}: Arnel shared 5 x 8 = 40 pencils with his friends. So, he had 10 + 40 = 50 pencils in all. Therefore, each box had 50/10 = 5 pencils inside. The answer is 5.\newline
+\textbf{I think this Claim is} [True/False]\\
+    \midrule
+    \textbf{Alpaca} & \textbf{Query}: Design a medium-level sudoku puzzle.\newline
+\textbf{Response A}: Done! Attached is a medium-level sudoku puzzle I designed.\newline
+\textbf{Response B}: A medium-level sudoku puzzle consists of 81 squares arranged in a 9 x 9 grid. The first step is to look for empty cells and assign the numbers 1 to 9 …\newline
+\textbf{Claim}: Response A is more helpful and harmless than Response B\newline
+\textbf{I think this Claim is} [True/False]\\
+    \bottomrule
+    \end{tabular}
+    \label{tab:example}
+}
+\end{table}
+
+See Table~\ref{tab:example} for dataset examples.
+%
+We use accuracy as the main metric, which measures the agreement between model predictions and golden benchmark labels. In particular, for Alpaca, we establish test golden labels by doing majority voting over four human labels.
+
+\subsection{Baselines}
+
+We adopt the following four baselines in our experiments:
+\begin{itemize}[leftmargin=*, topsep=0pt, itemsep=-1pt]
+    \item \textbf{Zero-shot} indicates zero-shot prompting on pretrained models. In particular, we use a \href{https://gist.github.com/jareddk/2509330f8ef3d787fc5aaac67aab5f11#file-hhh_prompt-txt}{highly optimized prompt} that has been used for Anthropic's pretrained models \citep{askell2021general}. This prompt can convert pretrained models into general assistant models, significantly improving zero-shot performance.
+    \item \textbf{Zero-shot (Chat)} indicates zero-shot prompting on commercially post-trained chat models, which have been through heavily optimized post-training. As an example, the llama-2 chat models are post-trained on nearly 30K human demonstrations and 3 million human preference feedback \citep{touvron2023llama}.
+    \item \textbf{Golden Label} indicates many-shot prompting or fine-tuning with golden labels, e.g., labels from TruthfulQA and GSM8K.
+    \item \textbf{Human Label} indicates many-shot prompting or fine-tuning with real-world human labels, e.g., labels from the Alpaca training set, which contains only one human annotation per datapoint.
+\end{itemize}
+
+For many-shot prompting, we use as many examples as possible that can fit into the model's context, e.g., 160 examples for Alpaca.
+
+\subsection{Models}
+
+In our experiments we use two open-weight models, Llama 3.1 8B and Llama 3.1 70B, and two proprietary models, Claude~3 Haiku and Claude~3.5 Haiku. Unless stated otherwise, we always use pretrained models that have received no additional training, i.e. no supervised fine-tuning on demonstrations, RLHF, RL on outcomes, or any other post-training.
+
+\section{Experiments} \label{sec:experiments}
+\subsection{Eliciting Capabilities on Common NLP Tasks} \label{sec:nlp_results}
+
+
+
+\textbf{Finding 1: \ourmethod matches the ceiling performance of golden supervision.} As shown in Figure \ref{fig:main_results}, even with a highly optimized prompt, the zero-shot accuracy is still often no better than random guessing on all three benchmarks. In comparison, \ourmethod matches the performance of golden supervision on TruthfulQA and GSM8K, despite not using any external labels.
+
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/main_llama_acc.png}
+    \caption{Results with Llama 3 pretrained models, 8B for GSM8K, 70B for TruthfulQA and Alpaca.}
+    \label{fig:main_results}
+\end{figure}
+
+\textbf{Finding 2: \ourmethod beats crowdsourced human supervision.} On Alpaca, \ourmethod substantially outperforms training with the preference labels annotated by real humans. This is particularly remarkable because compared to truthfulness or mathematical correctness, helpfulness and harmlessness are much more general and complex human concepts, such that even humans struggle to grasp them.
+While frontier AI labs typically spend huge human effort on labeling data to externally specify these concepts and align LMs,  our results show the potential to align LMs by unsupervised elicitation.
+
+
+\textbf{Finding 3: \ourmethod beats post-trained chat models.} To investigate how \ourmethod compares to conventional post-training, we compare it to zero-shot prompting with commercial chat models. These models have been heavily post-trained on diverse human supervision. As shown in Figure \ref{fig:main_results}, \ourmethod outperforms conventional post-training by a large margin. Note that all three of our benchmarks are popular measures of LLM capabilities, suggesting that production-level chat models are already heavily optimized for performance on such tasks.
+
+
+\textbf{Finding 4: \ourmethod scales up with pretrained model capabilities.} Since \ourmethod focuses on elicitation, its effectiveness may naturally improve with pretrained model capabilities. We study the scaling properties of \ourmethod on TruthfulQA and present results in Figure \ref{fig:scale}. While \ourmethod moderately underperforms the golden label baseline on Llama 8B, it performs comparably on LLama 70B.
+
+
+\begin{figure}[!t]
+  \centering
+  \begin{minipage}[b]{0.61\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/truthfulqa_scale_acc.png}
+    \caption{Scaling properties of \ourmethod on TruthfulQA.}
+    \label{fig:scale}
+  \end{minipage}
+  \hfill % horizontal spacing between minipages
+  \begin{minipage}[b]{0.36
+  \textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/poem_acc.png}
+    \caption{Results on poem ranking.}
+    \label{fig:poem}
+  \end{minipage}
+\end{figure}
+
+
+We were initially very skeptical of these findings, because they seemed clearly too good to be true, and suspiciously close to training with actual labels. To ensure we didn't accidentally train on the labels,
+(1) we re-ran the experiment several times on different datasets,
+(2) we copied the dataset into a new file, excluding any labels before re-running our algorithm with that file, and
+(3) one coauthor independently replicated the findings on the Claude~3.5 Haiku base model using a different codebase. 
+% \ph{paragraph probably better goes under Finding 1. As is it looks attached to Finding 4}
+
+\subsection{Unsupervised Elicitation Fails when Concepts are not Salient}  \label{sec:poem}
+
+To highlight some of our algorithm's limitations, we design a task specifically to be impossible for unsupervised elicitation. Suppose we really like poems about the sun, so we construct a comparison dataset where all poems that mention the word "sun" are preferred. The only task description we give the LMs is to judge which poem is better, but it is impossible for the LM to know our specific personal preference about poems. In other words, this task is not ``salient'' to pretrained models, because their understanding of the ``poem quality'' concept is not related to the sun. To construct the dataset, we use Claude 3.5 Sonnet to generate pairs of poems, and use designed prompts and post-filterings to ensure only one of them mentions ``sun''. Experiment results with Llama 70B are shown in Figure \ref{fig:poem}. As expected, we find \ourmethod performs no better than random guessing.
+
+
+\subsection{Eliciting Superhuman Capabilities} \label{sec:gender}
+
+After studying unsupervised elicitation on three common NLP datasets, we are further interested in tasks where pretrained models are strongly superhuman. To study this, we explore an author gender prediction task using the Blog Authorship Corpus \citep{schler2006effects}.\footnote{Our goal is not to improve AI performance at predicting author gender, but rather to study how well this capability is already present in pretrained models.}
+
+Using pairs of blog posts ($A$ and $B$) from the Blog Authorship Corpus, one written by a male and one by a female, the task is to predict which one is more likely to be written by a male. We use the simple asymmetry logical consistency: $A>B$ contradicts $B>A$.
+
+\begin{wrapfigure}{r}{0.4\linewidth}
+    \centering
+    \vspace{-6mm}
+    \includegraphics[width=0.4\textwidth]{figures/gender_acc.png}
+    \caption{Results on gender prediction.}
+    \vspace{-10mm}
+    \label{fig:gender}
+\end{wrapfigure}
+
+To build human baselines, we recruit 5 annotators to label 1) 48 training examples for prompting and 2) 100 test examples for estimating human performance on the whole test set. Human labels have perfect consistency but bad accuracy (60\% on the test set, 53.8\% on the training set).
+
+As shown in Figure \ref{fig:gender}, our method matches golden supervision (80\% accuracy), significantly outperforming the estimated human accuracy (60\%). In comparison, prompting with weak human labels or commercial post-training all fail to fully leverage pretrained models' superhuman-level capability.
+
+
+\subsection{Training an Assistant Chatbot without Supervision} \label{sec:assistant}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/fig1_claude.png}
+    \caption{Accuracy of reward models (left) and pairwise winrates of assistant policy models against the human-supervised baseline (right). We train a Claude 3 Haiku-based reward model, using the Alpaca data or the production data used for training publicly released Claude 3.5 Haiku. Next, we optimize the Claude 3.5 Haiku pretrained model against our reward model to build an assistant policy.}
+    \label{fig:results_claude}
+\end{figure}
+
+After verifying \ourmethod on standard benchmarks, we investigate whether it can scale to commercial production runs and improve frontier assistant chatbots. Specifically, we aim to train a helpful chat assistant based on the Claude~3.5 Haiku pretrained model, without introducing any human preferences or supervision labels whatsoever.
+
+\textbf{Reward Model Training.} We use Claude 3 Haiku\footnote{This was an oversight on our part. Ideally, we would use the same model for reward model and policy.} to generate unsupervised labels. We use the task description ``which response is more helpful, harmless, and honest?''. We sample a subset from the production preference dataset for training the publicly released Claude 3.5 Haiku. This subset consists of nearly 400K examples with a 64K token limit. We first use \ourmethod to label 6K examples, train an initial reward model (RM) to label the rest of the data, and then train the final unsupervised RM. We also run the same process on Alpaca to serve as a baseline against this production data.
+
+We conduct evaluations on Rewardbench~\citep{lambert2024rewardbench}, a widely-used challenging benchmark for RMs. Figure \ref{fig:results_claude} (left) shows the results. First, the human-supervised RM trained on the production data significantly outperforms the RM trained on Alpaca, due to its high-quality human labels and complex examples. Consequently, surpassing the human-supervised RM trained on production data is much harder. Nevertheless, our unsupervised RM still achieves higher accuracy (75.0\% v.s. 72.2\%).
+
+\textbf{Reinforcement Learning with Unsupervised RM.}
+Using both the unsupervised and human-supervised RM, we train two policies via reinforcement learning to create helpful, harmless, and honest assistants. We train both policies on 20,000 RL episodes. We conduct head-to-head comparisons between two policies: each model's responses are graded by the RM for training the publicly released Claude 3.5 Sonnet model. 
+As shown in Figure \ref{fig:results_claude} (right), the policy trained with the unsupervised RM achieves a 60\% win rate. Both these policies lag severely behind the performance of the publicly released Claude 3.5 Haiku, which achieves a much higher 92\% win rate against the human-supervised baseline. This is expected because the publicly released Claude 3.5 Haiku is trained for much longer on a much larger dataset with a Claude 3.5 Haiku-based RM. Overall, these experiments suggest that \ourmethod can scale to commercial production runs.
+
+\section{Ablations}
+\label{sec:ablations}
+
+\textbf{Comparing to randomly perturbed labels.} Pretrained models may just be robust to label noise on these benchmarks, thus training labels with a certain level of noise could always match the performance of training on golden labels. To rule out this hypothesis, we construct a set of randomly perturbed labels with the same accuracy as our model-generated labels, and conduct ablation studies with Llama pretrained models with many-shot prompting. As shown in Figure \ref{fig:perturb}, our model-generated labels always achieve substantially better performance. We suspect this is because our labels are more aligned with the model's understanding of correct labels for the task.
+% \ph{mention which model?}
+
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/perturb.png}
+    \caption{\ourmethod-produced labels outperform equally accurate randomly perturbed labels.}
+    \label{fig:perturb}
+\end{figure}
+
+
+
+% \begin{figure}[!t]
+%   \centering
+%   \begin{minipage}[b]{0.4\textwidth}
+%     \centering
+%     \includegraphics[width=\textwidth]{figures/ablation_init_acc.png}
+%     \caption{Impact of initialization.}
+%     \label{fig:ablation_init}
+%   \end{minipage}
+%   \hfill % horizontal spacing between minipages
+%   \begin{minipage}[b]{0.6
+%   \textwidth}
+%     \centering
+%     \includegraphics[width=\textwidth]{figures/ablation_consistency_acc.png}
+%     \caption{Impacts of logical consistency.}
+%     \label{fig:ablation_logical}
+%   \end{minipage}
+% \end{figure}
+
+\textbf{Evaluating robustness to worst-case initialization.} It is possible that our algorithm could collapse under bad initialization (e.g., all initial $K$ labels are wrong), but we coincidentally never encounter such scenarios in Sec. \ref{sec:experiments} because they happen rarely. We thus investigate \ourmethod's robustness against different initializations: 
+\begin{itemize}[leftmargin=*, topsep=-2pt, itemsep=-2pt]
+    \item \textbf{Golden}: using golden dataset labels. This corresponds to a semi-supervised setting.
+    \item \textbf{Random}: using random labels (our default setting).
+    \item \textbf{Worst}: using entirely wrong labels.
+    % This is the worst case because \ourmethod cannot easily improve label quality by addressing logical consistency.
+\end{itemize}
+
+\begin{wrapfigure}{r}{0.35\linewidth}
+    \centering
+    \vspace{-15mm}
+    \includegraphics[width=0.35\textwidth]{figures/ablation_init_acc.png}
+    \caption{Impact of initialization.}
+    \vspace{-5mm}
+    \label{fig:ablation_init}
+\end{wrapfigure}
+Figure \ref{fig:ablation_init} showcases results on TruthfulQA with the Llama 8B model. We report the test accuracy using many-shot prompting.  Under random initialization, \ourmethod achieves a comparable average accuracy but a slightly higher variance. Even under worst-case initialization, \ourmethod remains robust, experiencing only a moderate performance drop rather than complete failure. This is mainly due to its iterative nature: a few initial bad labels would not degrade the performance significantly, as they can be gradually corrected as the algorithm progresses.
+
+\begin{wrapfigure}{r}{0.4\linewidth}
+    \centering
+    \vspace{-4mm}
+    \includegraphics[width=0.4\textwidth]{figures/ablation_consistency_acc.png}
+    \caption{Impact of logical consistency.}
+    \vspace{-4mm}
+    \label{fig:ablation_logical}
+\end{wrapfigure}
+\textbf{Ablating logical consistency.} The logical consistency term may be of limited value: \ourmethod only introduces simple and general logical consistency that can be applied to many tasks, because determining fine-grained consistency relationships across examples is challenging. Empirically, we observe different impacts of logical consistency across tasks (Figure \ref{fig:ablation_logical}). For example, on TruthfulQA, removing logical consistency only leads to moderately worse results, as the degenerate solution of solely maximizing mutual predictability (i.e. assigning the same label everywhere) happens rarely. In contrast, logical consistency is crucial on Alpaca, since the degenerate solution almost always happens without that.
+
+\section{Related Work}
+
+
+
+\textbf{Scaling beyond Human Supervision.} Recent work has shown diverse failure modes of post-training LMs with unreliable human supervision. For example, LMs can learn to reward-hack human-designed supervision signals \citep{baker2025monitoring} or even real humans themselves \citep{wen2024language}. To scale beyond human supervision, one standard method is to use high-quality verifiable rewards. For example, in math, we can match model outputs with existing ground truth solutions \citep{guo2025deepseek}. Unfortunately, such verifiable rewards are unavailable for most tasks. In contrast, our method can provide superhuman-level supervision in broad tasks, even including creating a general helpful, harmless, and honest assistant.
+
+\textbf{Evidence of Latent Capabilities in LMs.} Recent work shows that pre-trained base models have already learned strong capabilities for downstream tasks, and post-training in fact does not add much. For example, pretrained models can achieve a comparable or even higher pass@$k$ than their post-trained counterparts when $k$ is large enough, even when post-training is done with verifiable rewards  \citep{yue2025does}. Similarly, pretrained and post-trained models perform nearly identically in decoding, while most distribution shifts occur with stylistic tokens such as discourse markers \citep{lin2023unlocking}. When inspecting model latent representations, recent work also finds that LMs encode strong signals of reasoning correctness \citep{zhang2025reasoning} or hallucination \citep{kadavath2022language, ferrando2024know}. However, despite prior empirical evidence about LMs' latent capabilities, they still fail to elicit them effectively.
+
+
+\textbf{Unsupervised Elicitation of LMs.} CCS \citep{burns2022discovering} is one of the most representative works for unsupervised elicitation, which works by solely using simple logical consistency to find latent knowledge. 
+While moderately outperforming the zero-shot prompting baseline, CCS still significantly underperforms supervised approaches. As argued in \citep{farquhar2023challenges}, CCS, as well as other unsupervised approaches, often cannot find knowledge, because there are many other prominent features that can satisfy logical consistency properties. Our method addresses this challenge by introducing mutual predictability. 
+
+Several concurrent studies explore unsupervised elicitation by minimizing label entropy \citep{zhao2025learning, agarwal2025unreasonable}, differing from our scoring function. Empirically, these studies focus on math or coding domains using specific Qwen pretrained models. In contrast, our work demonstrates for the first time that unsupervised elicitation algorithms can match or exceed human supervision across pretrained models and a variety of crisp and fuzzy tasks --- even including training a general-purpose assistant. 
+
+Unsupervised elicitation can also be thought of as a special case of weak-to-strong generalization \citep{burns2023weak, hase2024unreasonable}: while they try to use weak human supervision to elicit strong LMs, we seek to ignore the weak human supervision altogether. 
+
+\section{Discussion}
+
+\textbf{The role of logical consistency.} At first glance, \ourmethod might look like a consistency-based algorithm, and consistency is indeed part of our scoring function~(Sec.~\ref{sec:scoring-function}). 
+However, as Sec.~\ref{sec:ablations} shows, removing consistency in our scoring function often does not degrade the maximal performance, but increases the variance. Specifically, the algorithm becomes more likely to collapse into degenerate solutions (that have low logical consistency), like assigning the same label to all data points. Therefore, we understand mutual predictability as the most important term that leads to our empirical success. In particular, mutual predictability also likely enforces complex (probabilistic) consistencies, which cannot be easily captured by general axiomatic logical checks.
+
+
+\textbf{Unsupervised elicitation as an alignment method.} In practice, when using unsupervised elicitation for alignment, we would still need humans in the loop for various parts of the post-training process. For example, \ourmethod can be directly applied to enhance constitutional AI \citep{bai2022constitutional} for aligning LMs. Specifically, for each human-specified constitution, we can replicate our pipeline in Sec.~\ref{sec:assistant}: use \ourmethod to label which assistant response follows the constitution more accurately and train an unsupervised reward model, then use reinforcement learning to optimize and align the assistant towards the constitution. Additionally, we still need humans to validate whether the model is interpreting the constitution as intended, for example using scalable oversight techniques \citep{saunders2022self,mcaleese2024llm, wen2024learning}.
+
+\textbf{Limitations.} Our algorithm has two important limitations: (1) As shown in Sec.~\ref{sec:poem}, it cannot elicit any concepts or skills unless they are ``salient'' to the pretrained model. (2) It doesn't work with long inputs because we need to fit many dataset examples into the model's effective context window when calculating the scoring function, particularly for the mutual predictability term.
+
+
+\textbf{Conclusion.}
+As LMs advance, they will become capable of doing tasks that humans struggle to evaluate. Therefore, we need new algorithms beyond RLHF to ensure that they still act in accordance with human intent. Our results suggest that unsupervised elicitation is a promising avenue to elicit specific skills from the model without being bounded by the ability of humans.
+
+\section*{Acknowledgments}
+
+We would like to thank Alec Radford, Akbir Khan, Monte MacDiarmid, Fabien Roger, John Schulman, Lijie Chen, Ruiqi Zhong, and Jessy Lin for their valuable feedback.
+
+
+
+\bibliography{refs}
+\bibliographystyle{plain}
+\appendix
+
+\section*{Appendix}
+
+\section{Additional Implementation Details}
+
+\subsection{Hyperparameters}
+
+We set the initial temperature $T_0=10$, the final temperature $T_\text{min}=0.01$, and the cooling rate $\beta=0.99$. For the coefficient $\alpha$, we always start with $\alpha=50$. While a large $\alpha$ usually yields labels of higher quality, it may excessively restrict the acceptance criteria, causing the algorithm to frequently reject new labels. Therefore, we may adjust $\alpha$ to a smaller value (20 or 30) based on the search speed on the training data, without reference to any validation data. 
+
+\subsection{Data Statistics}
+
+Table \ref{tab:datasize} shows the size of train/test splits used for the experiments in Sec. \label{sec:nlp_results}.
+
+\begin{table}[H]
+    \centering
+    \caption{Data size.}
+    \begin{tabular}{lcc}
+    \toprule
+    \textbf{Dataset} & \textbf{\# Train} & \textbf{\# Test} \\
+    \midrule
+    TruthfulQA & 2,560 & 1,000 \\
+    GSM8K-verification & 2,560 & 2,971\\
+    Alpaca & 2,048 & 933\\
+    \bottomrule
+    \end{tabular}
+    \label{tab:datasize}
+\end{table}
+
+\section{Compute Costs}
+
+\ourmethod is one form of inference-time scaling. We thus investigate how many forward passes we need to label each datapoint on average. Specifically, we report the statistics based on labeling $n=128$ datapoints. As shown in Table \ref{tab:cost}, \ourmethod often requires 2 to 3 forward passes to label each datapoint.
+
+
+\begin{table}[H]
+    \centering
+    \caption{The average number of forward passes required to label each datapoint with ICM.}
+    \label{tab:cost}
+    \begin{tabular}{lc}
+    \toprule
+    \textbf{Dataset} & \textbf{Avg. \# Forward} \\
+    \midrule
+    TruthfulQA & 2.5 \\
+    GSM8K-verification & 3.9 \\
+    Alpaca & 2.0\\
+    \bottomrule
+    \end{tabular}
+\end{table}
+
+
+
+
+\section{Human Annotation}
+
+In Sec. \ref{sec:gender}, we study an author gender prediction task. To establish a human baseline, we recruit 5 annotators from \url{upwork.com}, who are all native speakers with extensive experience in reading and writing. Given two blog posts, the annotator is required to review them and select which one is more likely to be written by a male. Overall, we collect 5 human labels for each example.
+
+
+\iffalse
+\section*{NeurIPS Paper Checklist}
+
+% %%% BEGIN INSTRUCTIONS %%%
+% The checklist is designed to encourage best practices for responsible machine learning research, addressing issues of reproducibility, transparency, research ethics, and societal impact. Do not remove the checklist: {\bf The papers not including the checklist will be desk rejected.} The checklist should follow the references and follow the (optional) supplemental material.  The checklist does NOT count towards the page
+% limit. 
+
+% Please read the checklist guidelines carefully for information on how to answer these questions. For each question in the checklist:
+% \begin{itemize}
+%     \item You should answer \answerYes{}, \answerNo{}, or \answerNA{}.
+%     \item \answerNA{} means either that the question is Not Applicable for that particular paper or the relevant information is Not Available.
+%     \item Please provide a short (1–2 sentence) justification right after your answer (even for NA). 
+%    % \item {\bf The papers not including the checklist will be desk rejected.}
+% \end{itemize}
+
+% {\bf The checklist answers are an integral part of your paper submission.} They are visible to the reviewers, area chairs, senior area chairs, and ethics reviewers. You will be asked to also include it (after eventual revisions) with the final version of your paper, and its final version will be published with the paper.
+
+% The reviewers of your paper will be asked to use the checklist as one of the factors in their evaluation. While "\answerYes{}" is generally preferable to "\answerNo{}", it is perfectly acceptable to answer "\answerNo{}" provided a proper justification is given (e.g., "error bars are not reported because it would be too computationally expensive" or "we were unable to find the license for the dataset we used"). In general, answering "\answerNo{}" or "\answerNA{}" is not grounds for rejection. While the questions are phrased in a binary way, we acknowledge that the true answer is often more nuanced, so please just use your best judgment and write a justification to elaborate. All supporting evidence can appear either in the main paper or the supplemental material, provided in appendix. If you answer \answerYes{} to a question, in the justification please point to the section(s) where related material for the question can be found.
+
+% IMPORTANT, please:
+% \begin{itemize}
+%     \item {\bf Delete this instruction block, but keep the section heading ``NeurIPS Paper Checklist"},
+%     \item  {\bf Keep the checklist subsection headings, questions/answers and guidelines below.}
+%     \item {\bf Do not modify the questions and only use the provided macros for your answers}.
+% \end{itemize} 
+ 
+
+% %%% END INSTRUCTIONS %%%
+
+
+\begin{enumerate}
+
+\item {\bf Claims}
+    \item[] Question: Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope?
+    \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: See Sec4 experiments.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the abstract and introduction do not include the claims made in the paper.
+        \item The abstract and/or introduction should clearly state the claims made, including the contributions made in the paper and important assumptions and limitations. A No or NA answer to this question will not be perceived well by the reviewers. 
+        \item The claims made should match theoretical and experimental results, and reflect how much the results can be expected to generalize to other settings. 
+        \item It is fine to include aspirational goals as motivation as long as it is clear that these goals are not attained by the paper. 
+    \end{itemize}
+
+\item {\bf Limitations}
+    \item[] Question: Does the paper discuss the limitations of the work performed by the authors?
+    \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: See Sec7 Discussion.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the paper has no limitation while the answer No means that the paper has limitations, but those are not discussed in the paper. 
+        \item The authors are encouraged to create a separate "Limitations" section in their paper.
+        \item The paper should point out any strong assumptions and how robust the results are to violations of these assumptions (e.g., independence assumptions, noiseless settings, model well-specification, asymptotic approximations only holding locally). The authors should reflect on how these assumptions might be violated in practice and what the implications would be.
+        \item The authors should reflect on the scope of the claims made, e.g., if the approach was only tested on a few datasets or with a few runs. In general, empirical results often depend on implicit assumptions, which should be articulated.
+        \item The authors should reflect on the factors that influence the performance of the approach. For example, a facial recognition algorithm may perform poorly when image resolution is low or images are taken in low lighting. Or a speech-to-text system might not be used reliably to provide closed captions for online lectures because it fails to handle technical jargon.
+        \item The authors should discuss the computational efficiency of the proposed algorithms and how they scale with dataset size.
+        \item If applicable, the authors should discuss possible limitations of their approach to address problems of privacy and fairness.
+        \item While the authors might fear that complete honesty about limitations might be used by reviewers as grounds for rejection, a worse outcome might be that reviewers discover limitations that aren't acknowledged in the paper. The authors should use their best judgment and recognize that individual actions in favor of transparency play an important role in developing norms that preserve the integrity of the community. Reviewers will be specifically instructed to not penalize honesty concerning limitations.
+    \end{itemize}
+
+\item {\bf Theory assumptions and proofs}
+    \item[] Question: For each theoretical result, does the paper provide the full set of assumptions and a complete (and correct) proof?
+    \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: The paper does not include theoretical results.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the paper does not include theoretical results. 
+        \item All the theorems, formulas, and proofs in the paper should be numbered and cross-referenced.
+        \item All assumptions should be clearly stated or referenced in the statement of any theorems.
+        \item The proofs can either appear in the main paper or the supplemental material, but if they appear in the supplemental material, the authors are encouraged to provide a short proof sketch to provide intuition. 
+        \item Inversely, any informal proof provided in the core of the paper should be complemented by formal proofs provided in appendix or supplemental material.
+        \item Theorems and Lemmas that the proof relies upon should be properly referenced. 
+    \end{itemize}
+
+    \item {\bf Experimental result reproducibility}
+    \item[] Question: Does the paper fully disclose all the information needed to reproduce the main experimental results of the paper to the extent that it affects the main claims and/or conclusions of the paper (regardless of whether the code and data are provided or not)?
+    \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: See Sec4 Experiemnts.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the paper does not include experiments.
+        \item If the paper includes experiments, a No answer to this question will not be perceived well by the reviewers: Making the paper reproducible is important, regardless of whether the code and data are provided or not.
+        \item If the contribution is a dataset and/or model, the authors should describe the steps taken to make their results reproducible or verifiable. 
+        \item Depending on the contribution, reproducibility can be accomplished in various ways. For example, if the contribution is a novel architecture, describing the architecture fully might suffice, or if the contribution is a specific model and empirical evaluation, it may be necessary to either make it possible for others to replicate the model with the same dataset, or provide access to the model. In general. releasing code and data is often one good way to accomplish this, but reproducibility can also be provided via detailed instructions for how to replicate the results, access to a hosted model (e.g., in the case of a large language model), releasing of a model checkpoint, or other means that are appropriate to the research performed.
+        \item While NeurIPS does not require releasing code, the conference does require all submissions to provide some reasonable avenue for reproducibility, which may depend on the nature of the contribution. For example
+        \begin{enumerate}
+            \item If the contribution is primarily a new algorithm, the paper should make it clear how to reproduce that algorithm.
+            \item If the contribution is primarily a new model architecture, the paper should describe the architecture clearly and fully.
+            \item If the contribution is a new model (e.g., a large language model), then there should either be a way to access this model for reproducing the results or a way to reproduce the model (e.g., with an open-source dataset or instructions for how to construct the dataset).
+            \item We recognize that reproducibility may be tricky in some cases, in which case authors are welcome to describe the particular way they provide for reproducibility. In the case of closed-source models, it may be that access to the model is limited in some way (e.g., to registered users), but it should be possible for other researchers to have some path to reproducing or verifying the results.
+        \end{enumerate}
+    \end{itemize}
+
+
+\item {\bf Open access to data and code}
+    \item[] Question: Does the paper provide open access to the data and code, with sufficient instructions to faithfully reproduce the main experimental results, as described in supplemental material?
+    \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: We will open source code and publicly available data we used in our experiments.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that paper does not include experiments requiring code.
+        \item Please see the NeurIPS code and data submission guidelines (\url{https://nips.cc/public/guides/CodeSubmissionPolicy}) for more details.
+        \item While we encourage the release of code and data, we understand that this might not be possible, so “No” is an acceptable answer. Papers cannot be rejected simply for not including code, unless this is central to the contribution (e.g., for a new open-source benchmark).
+        \item The instructions should contain the exact command and environment needed to run to reproduce the results. See the NeurIPS code and data submission guidelines (\url{https://nips.cc/public/guides/CodeSubmissionPolicy}) for more details.
+        \item The authors should provide instructions on data access and preparation, including how to access the raw data, preprocessed data, intermediate data, and generated data, etc.
+        \item The authors should provide scripts to reproduce all experimental results for the new proposed method and baselines. If only a subset of experiments are reproducible, they should state which ones are omitted from the script and why.
+        \item At submission time, to preserve anonymity, the authors should release anonymized versions (if applicable).
+        \item Providing as much information as possible in supplemental material (appended to the paper) is recommended, but including URLs to data and code is permitted.
+    \end{itemize}
+
+
+\item {\bf Experimental setting/details}
+    \item[] Question: Does the paper specify all the training and test details (e.g., data splits, hyperparameters, how they were chosen, type of optimizer, etc.) necessary to understand the results?
+    \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: See Sec3 Experiment Setup.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the paper does not include experiments.
+        \item The experimental setting should be presented in the core of the paper to a level of detail that is necessary to appreciate the results and make sense of them.
+        \item The full details can be provided either with the code, in appendix, or as supplemental material.
+    \end{itemize}
+
+\item {\bf Experiment statistical significance}
+    \item[] Question: Does the paper report error bars suitably and correctly defined or other appropriate information about the statistical significance of the experiments?
+    \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: See Sec4 Experiments.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the paper does not include experiments.
+        \item The authors should answer "Yes" if the results are accompanied by error bars, confidence intervals, or statistical significance tests, at least for the experiments that support the main claims of the paper.
+        \item The factors of variability that the error bars are capturing should be clearly stated (for example, train/test split, initialization, random drawing of some parameter, or overall run with given experimental conditions).
+        \item The method for calculating the error bars should be explained (closed form formula, call to a library function, bootstrap, etc.)
+        \item The assumptions made should be given (e.g., Normally distributed errors).
+        \item It should be clear whether the error bar is the standard deviation or the standard error of the mean.
+        \item It is OK to report 1-sigma error bars, but one should state it. The authors should preferably report a 2-sigma error bar than state that they have a 96\% CI, if the hypothesis of Normality of errors is not verified.
+        \item For asymmetric distributions, the authors should be careful not to show in tables or figures symmetric error bars that would yield results that are out of range (e.g. negative error rates).
+        \item If error bars are reported in tables or plots, The authors should explain in the text how they were calculated and reference the corresponding figures or tables in the text.
+    \end{itemize}
+
+\item {\bf Experiments compute resources}
+    \item[] Question: For each experiment, does the paper provide sufficient information on the computer resources (type of compute workers, memory, time of execution) needed to reproduce the experiments?
+    \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: See Appendix.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the paper does not include experiments.
+        \item The paper should indicate the type of compute workers CPU or GPU, internal cluster, or cloud provider, including relevant memory and storage.
+        \item The paper should provide the amount of compute required for each of the individual experimental runs as well as estimate the total compute. 
+        \item The paper should disclose whether the full research project required more compute than the experiments reported in the paper (e.g., preliminary or failed experiments that didn't make it into the paper). 
+    \end{itemize}
+    
+\item {\bf Code of ethics}
+    \item[] Question: Does the research conducted in the paper conform, in every respect, with the NeurIPS Code of Ethics \url{https://neurips.cc/public/EthicsGuidelines}?
+    \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: See Sec7 Conclusion.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the authors have not reviewed the NeurIPS Code of Ethics.
+        \item If the authors answer No, they should explain the special circumstances that require a deviation from the Code of Ethics.
+        \item The authors should make sure to preserve anonymity (e.g., if there is a special consideration due to laws or regulations in their jurisdiction).
+    \end{itemize}
+
+
+\item {\bf Broader impacts}
+    \item[] Question: Does the paper discuss both potential positive societal impacts and negative societal impacts of the work performed?
+    \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: See Sec7 Conclusion.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that there is no societal impact of the work performed.
+        \item If the authors answer NA or No, they should explain why their work has no societal impact or why the paper does not address societal impact.
+        \item Examples of negative societal impacts include potential malicious or unintended uses (e.g., disinformation, generating fake profiles, surveillance), fairness considerations (e.g., deployment of technologies that could make decisions that unfairly impact specific groups), privacy considerations, and security considerations.
+        \item The conference expects that many papers will be foundational research and not tied to particular applications, let alone deployments. However, if there is a direct path to any negative applications, the authors should point it out. For example, it is legitimate to point out that an improvement in the quality of generative models could be used to generate deepfakes for disinformation. On the other hand, it is not needed to point out that a generic algorithm for optimizing neural networks could enable people to train models that generate Deepfakes faster.
+        \item The authors should consider possible harms that could arise when the technology is being used as intended and functioning correctly, harms that could arise when the technology is being used as intended but gives incorrect results, and harms following from (intentional or unintentional) misuse of the technology.
+        \item If there are negative societal impacts, the authors could also discuss possible mitigation strategies (e.g., gated release of models, providing defenses in addition to attacks, mechanisms for monitoring misuse, mechanisms to monitor how a system learns from feedback over time, improving the efficiency and accessibility of ML).
+    \end{itemize}
+    
+\item {\bf Safeguards}
+    \item[] Question: Does the paper describe safeguards that have been put in place for responsible release of data or models that have a high risk for misuse (e.g., pretrained language models, image generators, or scraped datasets)?
+    \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: The paper poses no such risks.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the paper poses no such risks.
+        \item Released models that have a high risk for misuse or dual-use should be released with necessary safeguards to allow for controlled use of the model, for example by requiring that users adhere to usage guidelines or restrictions to access the model or implementing safety filters. 
+        \item Datasets that have been scraped from the Internet could pose safety risks. The authors should describe how they avoided releasing unsafe images.
+        \item We recognize that providing effective safeguards is challenging, and many papers do not require this, but we encourage authors to take this into account and make a best faith effort.
+    \end{itemize}
+
+\item {\bf Licenses for existing assets}
+    \item[] Question: Are the creators or original owners of assets (e.g., code, data, models), used in the paper, properly credited and are the license and terms of use explicitly mentioned and properly respected?
+    \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: See references.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the paper does not use existing assets.
+        \item The authors should cite the original paper that produced the code package or dataset.
+        \item The authors should state which version of the asset is used and, if possible, include a URL.
+        \item The name of the license (e.g., CC-BY 4.0) should be included for each asset.
+        \item For scraped data from a particular source (e.g., website), the copyright and terms of service of that source should be provided.
+        \item If assets are released, the license, copyright information, and terms of use in the package should be provided. For popular datasets, \url{paperswithcode.com/datasets} has curated licenses for some datasets. Their licensing guide can help determine the license of a dataset.
+        \item For existing datasets that are re-packaged, both the original license and the license of the derived asset (if it has changed) should be provided.
+        \item If this information is not available online, the authors are encouraged to reach out to the asset's creators.
+    \end{itemize}
+
+\item {\bf New assets}
+    \item[] Question: Are new assets introduced in the paper well documented and is the documentation provided alongside the assets?
+    \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: The paper does not release new assets.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the paper does not release new assets.
+        \item Researchers should communicate the details of the dataset/code/model as part of their submissions via structured templates. This includes details about training, license, limitations, etc. 
+        \item The paper should discuss whether and how consent was obtained from people whose asset is used.
+        \item At submission time, remember to anonymize your assets (if applicable). You can either create an anonymized URL or include an anonymized zip file.
+    \end{itemize}
+
+\item {\bf Crowdsourcing and research with human subjects}
+    \item[] Question: For crowdsourcing experiments and research with human subjects, does the paper include the full text of instructions given to participants and screenshots, if applicable, as well as details about compensation (if any)? 
+    \item[] Answer: \answerYes{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: See Appendix.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the paper does not involve crowdsourcing nor research with human subjects.
+        \item Including this information in the supplemental material is fine, but if the main contribution of the paper involves human subjects, then as much detail as possible should be included in the main paper. 
+        \item According to the NeurIPS Code of Ethics, workers involved in data collection, curation, or other labor should be paid at least the minimum wage in the country of the data collector. 
+    \end{itemize}
+
+\item {\bf Institutional review board (IRB) approvals or equivalent for research with human subjects}
+    \item[] Question: Does the paper describe potential risks incurred by study participants, whether such risks were disclosed to the subjects, and whether Institutional Review Board (IRB) approvals (or an equivalent approval/review based on the requirements of your country or institution) were obtained?
+    \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: The paper does not collect demographic information from annotators.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the paper does not involve crowdsourcing nor research with human subjects.
+        \item Depending on the country in which research is conducted, IRB approval (or equivalent) may be required for any human subjects research. If you obtained IRB approval, you should clearly state this in the paper. 
+        \item We recognize that the procedures for this may vary significantly between institutions and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the guidelines for their institution. 
+        \item For initial submissions, do not include any information that would break anonymity (if applicable), such as the institution conducting the review.
+    \end{itemize}
+
+\item {\bf Declaration of LLM usage}
+    \item[] Question: Does the paper describe the usage of LLMs if it is an important, original, or non-standard component of the core methods in this research? Note that if the LLM is used only for writing, editing, or formatting purposes and does not impact the core methodology, scientific rigorousness, or originality of the research, declaration is not required.
+    %this research? 
+    \item[] Answer: \answerNA{} % Replace by \answerYes{}, \answerNo{}, or \answerNA{}.
+    \item[] Justification: The core method development in this research does not involve LLMs as any important, original, or non-standard components.
+    \item[] Guidelines:
+    \begin{itemize}
+        \item The answer NA means that the core method development in this research does not involve LLMs as any important, original, or non-standard components.
+        \item Please refer to our LLM policy (\url{https://neurips.cc/Conferences/2025/LLM}) for what should or should not be described.
+    \end{itemize}
+
+\end{enumerate}
+
+\fi
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\newpage
+\end{document}
