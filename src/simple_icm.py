@@ -54,12 +54,12 @@ class Config:
     decay_rate: float = 0.99
     beta: float = 2.0
     num_seed: int = 8
-    max_iters: int = 2500000  # should be at least dataset size X 2
+    max_iters: int = 2500  # should be at least dataset size X 2
     n_shots: int = 6  # Number of in-context examples
     model_id: str = "meta-llama/llama-3.1-8b-instruct"  # Logprobs supported
     provider_whitelist: Tuple[str] = None  # None to let OpenRouter choose
     out_dir: Path = Path("../outputs/icm")  # Directory to save outputs
-    log_interval: int = 20  # Log progress every N iterations
+    log_interval: int = 100  # Log progress every N iterations
 
 C = Config(
     model_id="qwen/qwen3-235b-a22b-2507", # $0.2 0.6
@@ -136,7 +136,7 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False, all
     fewshot = []
     for demo in relevant_demos:
         label_str = "A" if demo['label'] == 1 else "B"
-        fewshot.append(f"\n\n## Candidate:\n{demo['prompt']}\n## Set: {label_str}")
+        fewshot.append(f"\n\n## Candidate:\n{demo['prompt']}\n## Set:\n{label_str}")
 
     # Use all_demos if provided (for unlabeled examples), otherwise use current_demos
     demos_source = all_demos if all_demos is not None else current_demos
@@ -319,88 +319,92 @@ async def run_icm(demonstrations, config=C):
     current_labeled = {k: v for k, v in demonstrations.items() if v['label'] is not None}
     old_energy, old_metrics = compute_energy(demonstrations, config)
     
-    for iter in range(config.max_iters):
-        # Weighted sampling for inconsistent groups
-        groups = {}
-        all_uids = list(demonstrations.keys())
-        for uid in all_uids:
-            cid = demonstrations[uid]['consistency_id']
-            if cid not in groups:
-                groups[cid] = []
-            groups[cid].append(uid)
-        
-        weights = [0.1 for _ in all_uids]  # Base low
-        
-        for cid, group_uids in groups.items():
-            labeled_labels = [demonstrations[uid]['label'] for uid in group_uids if demonstrations[uid]['label'] is not None]
-            num_labeled = len(labeled_labels)
-            num_unlabeled = len(group_uids) - num_labeled
+    try:
+        for iter in range(config.max_iters):
+            # Weighted sampling for inconsistent groups
+            groups = {}
+            all_uids = list(demonstrations.keys())
+            for uid in all_uids:
+                cid = demonstrations[uid]['consistency_id']
+                if cid not in groups:
+                    groups[cid] = []
+                groups[cid].append(uid)
             
-            inconsistency = 0
-            if num_labeled > 0:
-                unique_labels = set(labeled_labels)
-                inconsistency = 1 if len(unique_labels) > 1 else 0
+            weights = [0.1 for _ in all_uids]  # Base low
             
-            if num_unlabeled > 0:
-                weight_factor = (0.5 + 0.5 * inconsistency) * (1 + num_unlabeled / len(group_uids))
-                for uid in group_uids:
-                    if demonstrations[uid]['label'] is None:  # Unlabeled
-                        idx = all_uids.index(uid)
-                        weights[idx] = weight_factor
-            else:
-                # Fully labeled groups with inconsistency get higher weight for re-prediction
-                if inconsistency:
+            for cid, group_uids in groups.items():
+                labeled_labels = [demonstrations[uid]['label'] for uid in group_uids if demonstrations[uid]['label'] is not None]
+                num_labeled = len(labeled_labels)
+                num_unlabeled = len(group_uids) - num_labeled
+                
+                inconsistency = 0
+                if num_labeled > 0:
+                    unique_labels = set(labeled_labels)
+                    inconsistency = 1 if len(unique_labels) > 1 else 0
+                
+                if num_unlabeled > 0:
+                    weight_factor = (0.5 + 0.5 * inconsistency) * (1 + num_unlabeled / len(group_uids))
                     for uid in group_uids:
-                        idx = all_uids.index(uid)
-                        weights[idx] = 0.5 + random.uniform(0, 0.2)  # Higher than base, lower than unlabeled; +rand for exploration/flipping
+                        if demonstrations[uid]['label'] is None:  # Unlabeled
+                            idx = all_uids.index(uid)
+                            weights[idx] = weight_factor
                 else:
-                    for uid in group_uids:
-                        idx = all_uids.index(uid)
-                        weights[idx] = 0.1
-        # TODO: Weight by potential energy delta: for candidates, temp-assign/predict label, compute delta U vs current, prioritize high positive delta (improves over score; low complexity, med value).
-        
-        weights = [max(w, 0.01) for w in weights]
-        example_uid = random.choices(all_uids, weights=weights)[0]
-        
-        # Predict new label
-        if iter%100==0:
-            verbose = 1
-        elif iter%100==1:
-            verbose = 2
-        else:
-            verbose = 0
-        new_label, score = await predict_label(example_uid, current_labeled, config, verbose=verbose, all_demos=demonstrations)
+                    # Fully labeled groups with inconsistency get higher weight for re-prediction
+                    if inconsistency:
+                        for uid in group_uids:
+                            idx = all_uids.index(uid)
+                            weights[idx] = 0.5 + random.uniform(0, 0.2)  # Higher than base, lower than unlabeled; +rand for exploration/flipping
+                    else:
+                        for uid in group_uids:
+                            idx = all_uids.index(uid)
+                            weights[idx] = 0.1
+            # TODO: Weight by potential energy delta: for candidates, temp-assign/predict label, compute delta U vs current, prioritize high positive delta (improves over score; low complexity, med value).
+            
+            weights = [max(w, 0.01) for w in weights]
+            example_uid = random.choices(all_uids, weights=weights)[0]
+            
+            # Predict new label
+            if iter%100==0:
+                verbose = 1
+            elif iter%100==1:
+                verbose = 2
+            else:
+                verbose = 0
+            new_label, score = await predict_label(example_uid, current_labeled, config, verbose=verbose, all_demos=demonstrations)
 
-        # Update with new label and fix any inconsistencies ONLY if label changed
-        temp_demos = deepcopy(demonstrations)
-        temp_demos[example_uid]['label'] = new_label
-        temp_demos[example_uid]['score'] = score
-        
-        # Only fix inconsistencies if the label actually changed
-        if demonstrations[example_uid]['label'] != new_label:
-            temp_demos = await fix_inconsistencies_greedy(temp_demos, config)
-        
-        # Compute new energy
-        new_energy, new_metrics = compute_energy(temp_demos, config)
-        delta = new_energy - old_energy
-        temp_demos[example_uid]['deltaE'] = delta
-        
-        # Annealing decision
-        T = max(config.final_t, config.initial_t / (1 + config.beta * math.log(1 + iter)))
-        accept_msg = f"Delta: {delta:.2f}, T: {T:.2f}, Acc: {new_metrics['accuracy']:.2f}"
-        if delta > 0 or random.random() < math.exp(delta / T):
-            demonstrations = temp_demos
-            old_energy = new_energy
-            current_labeled = {k: v for k, v in demonstrations.items() if v['label'] is not None}
-            logger.debug("Iter {}: Accepted. Energy: {:.2f}. {}", iter, old_energy, accept_msg)
-        else:
-            logger.debug("Iter {}: Rejected. {}", iter, accept_msg)
-        
-        energies.append(old_energy)
-        accuracies.append(new_metrics['accuracy'])
-        
-        if iter % C.log_interval == 0:
-            logger.info(f"Progress: Labeled {new_metrics['num_labeled']}, Inconsistents: {new_metrics['num_inconsistent']}. Acc: {new_metrics['accuracy']:.2f}, Energy: {old_energy:.2f}. Cost so far: ${total_cost:.4f}")
+            # Update with new label and fix any inconsistencies ONLY if label changed
+            temp_demos = deepcopy(demonstrations)
+            temp_demos[example_uid]['label'] = new_label
+            temp_demos[example_uid]['score'] = score
+            
+            # Only fix inconsistencies if the label actually changed
+            if demonstrations[example_uid]['label'] != new_label:
+                temp_demos = await fix_inconsistencies_greedy(temp_demos, config)
+            
+            # Compute new energy
+            new_energy, new_metrics = compute_energy(temp_demos, config)
+            delta = new_energy - old_energy
+            temp_demos[example_uid]['deltaE'] = delta
+            
+            # Annealing decision
+            T = max(config.final_t, config.initial_t / (1 + config.beta * math.log(1 + iter)))
+            accept_msg = f"Delta: {delta:.2f}, T: {T:.2f}, Acc: {new_metrics['accuracy']:.2f}"
+            if delta > 0 or random.random() < math.exp(delta / T):
+                demonstrations = temp_demos
+                old_energy = new_energy
+                current_labeled = {k: v for k, v in demonstrations.items() if v['label'] is not None}
+                logger.debug("Iter {}: Accepted. Energy: {:.2f}. {}", iter, old_energy, accept_msg)
+            else:
+                logger.debug("Iter {}: Rejected. {}", iter, accept_msg)
+            
+            energies.append(old_energy)
+            accuracies.append(new_metrics['accuracy'])
+            
+            if iter % C.log_interval == 0:
+                logger.info(f"Progress: Labeled {new_metrics['num_labeled']}, Inconsistents: {new_metrics['num_inconsistent']}. Acc: {new_metrics['accuracy']:.2f}, Energy: {old_energy:.2f}. Cost so far: ${total_cost:.4f}")
+    
+    except KeyboardInterrupt:
+        logger.info("Stopping early.")
     
     return demonstrations, energies, accuracies
 
