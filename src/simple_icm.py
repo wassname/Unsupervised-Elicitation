@@ -19,7 +19,7 @@ from dataclasses import dataclass, asdict
 import dotenv
 from loguru import logger
 from openrouter_wrapper.logprobs import openrouter_completion_wlogprobs, get_logprobs_choices, LogprobsNotSupportedError  # User's wrapper
-from typing import List, Tuple, Callable
+from typing import List, Tuple, Callable, Literal
 import asyncio
 from aiocache import cached
 from itertools import combinations
@@ -43,6 +43,7 @@ logger.add(sys.stderr, format="<green>{time:YYYY-MM-DD HH:mm}</green> | <level>{
 
 # Global cost tracker
 total_cost = 0.0
+reasoning_log = ""
 
 # %% [code]
 
@@ -56,16 +57,22 @@ class Config:
     num_seed: int = 8
     max_iters: int = 2500  # should be at least dataset size X 2
     n_shots: int = 6  # Number of in-context examples
-    model_id: str = "meta-llama/llama-3.1-8b-instruct"  # Logprobs supported
-    provider_whitelist: Tuple[str] = None  # None to let OpenRouter choose
+    # model_id: str = "meta-llama/llama-3.1-8b-instruct"  # Logprobs supported
+    model_id: str = "qwen/qwen3-235b-a22b-2507"  # Logprobs supported
+    provider_whitelist: Tuple[str] = ('Chutes','Nebius',)  # None to let OpenRouter choose
     out_dir: Path = Path("../outputs/icm")  # Directory to save outputs
     log_interval: int = 100  # Log progress every N iterations
+    dataset: Literal["truthfulqa", "daily_dilemmas"] = "truthfulqa"  # Dataset name for logging
 
-C = Config(
-    model_id="qwen/qwen3-235b-a22b-2507", # $0.2 0.6
-    provider_whitelist=[ 'Chutes','Nebius',], 
-)
-C.out_dir.mkdir(parents=True, exist_ok=True)
+
+import simple_parsing
+
+C: Config = simple_parsing.parse(Config)
+
+# C = Config(
+#     model_id="qwen/qwen3-235b-a22b-2507", # $0.2 0.6
+#     provider_whitelist=[ 'Chutes','Nebius',], 
+# )
 
 # C = Config(
 #     model_id="qwen/qwen3-30b-a3b-instruct-2507", # 0.08 $0.33
@@ -79,14 +86,23 @@ C.out_dir.mkdir(parents=True, exist_ok=True)
 
 logger.info(f"Config: {C}")
 config_dict = asdict(C)
-config_dict['out_dir'] = str(config_dict['out_dir'])
-with open(C.out_dir / "icm_config.json", "w") as f:
+out_dir = C.out_dir / C.dataset.replace(' ', '_').replace('/', '_')
+out_dir.mkdir(parents=True, exist_ok=True)
+config_dict['out_dir'] = str(C.out_dir)
+with open(out_dir / "icm_config.json", "w") as f:
     json.dump(config_dict, f, indent=2)
 
 # %% [code]
 from src.data.truthfulqa import load_truthfulqa, is_consistent
+from data.daily_dilemmas import load_daily_dilemma
 
-data = load_truthfulqa()
+if C.dataset == "truthfulqa":
+    data = load_truthfulqa()
+elif C.dataset == "daily_dilemmas":
+    data = load_daily_dilemma()
+else:
+    raise ValueError(f"Unknown dataset {C.dataset}")
+
 logger.info("Loaded {} examples", len(data))
 
 # %% [code]
@@ -145,6 +161,9 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False, all
         {"role": "user", "content": instruction+"".join(fewshot)+f"\n\n## Candidate:\n{target_prompt}"},
         {"role": "assistant", "content": "\n## Set:"} # Assistant prefill to ensure 
     ]
+
+    if verbose>1:
+        messages[0]['content'] = "ALWAYS GIVE BRIEF REASONING AFTERWARDS. " + messages[0]['content']
     
 
     response = await cached_openrouter_completion_wlogprobs(
@@ -152,6 +171,7 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False, all
         provider_whitelist=config.provider_whitelist,
         messages=messages,
         max_completion_tokens=160 if verbose else 5,
+        min_completion_tokens=30 if verbose else 1,
         temperature=0.4,
         top_logprobs=8,
     )
@@ -160,9 +180,14 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False, all
     
     if verbose:
         logger.info(f"Debug Prediction - UID {example_uid}:")
-        logger.info(f"messages: {print_messages(messages)}")
-        logger.info(f"Response Content: {response['choices'][0]['message']['content']}")
+        logger.info(f"messages: `{print_messages(messages)}`")
+        logger.info(f"Response Content: `{response['choices'][0]['message']['content']}`")
         logger.info(f"--- End Debug ---")
+        if verbose>1:
+            global reasoning_log
+            reasoning_log += f"\n\n## Candidate:\n{target_prompt}\n## Set:\n"
+            reasoning_log += response['choices'][0]['message']['content']
+
         
     try:
         choice_strs = ["A", "B"]
@@ -174,7 +199,7 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False, all
 
         if not choice_in_toplogp:
             model_response = response['choices'][0]['message']['content']
-            logger.warning(f"Choices not returned for UID {example_uid}, may indicate model confusion. choice_logp={choice_logp}. Instead we got these top logprobs: {top_logp} and \nmessages: {print_messages(messages)}\nthis output: {model_response}")
+            logger.warning(f"Choices not returned for UID {example_uid}, may indicate model confusion. choice_logp={choice_logp}. Instead we got these top logprobs: {top_logp} and \nmessages: ...`{print_messages(messages)[-90:]}`\nthis output:`{model_response}`")
         score = choice_logp["A"] - choice_logp["B"]
         predicted = 1 if score > 0 else 0
         return predicted, float(score)
@@ -223,6 +248,9 @@ def compute_energy(demos, config=C):
     
     energy = config.alpha * avg_lprob - num_inconsistent - (num_inconsistent / max(1, len(labeled)))  # Normalized penalty
     accuracy = np.mean([d['label'] == d['vanilla_label'] for d in labeled])
+    # flip acc if needed, as this is unsupervised
+    if accuracy < 0.5:
+        accuracy = 1 - accuracy
     return energy, {
         'avg_lprob': avg_lprob,
         'num_inconsistent': num_inconsistent,
@@ -405,6 +433,8 @@ async def run_icm(demonstrations, config=C):
     
     except KeyboardInterrupt:
         logger.info("Stopping early.")
+    except asyncio.CancelledError:
+        logger.info("Asyncio task cancelled.")
     
     return demonstrations, energies, accuracies
 
@@ -418,13 +448,13 @@ logger.info("\nFinal Results:")
 logger.info("Total cost: ${:.4f}", total_cost)
 logger.info("Energy: {:.2f}", final_energy)
 # TODO show vanilla accuracy here for comparison
-logger.info("Accuracy vs vanilla: {:.2f}, initial {:.2f}", final_metrics['accuracy'], accuracies[0])
+logger.info("Accuracy [labelled] vs vanilla: {:.2f}, initial {:.2f}", final_metrics['accuracy'], accuracies[0])
 logger.info("Labeled: {}/{}", final_metrics['num_labeled'], len(data))
 logger.info("Inconsistencies: {}", final_metrics['num_inconsistent'])
 
 # Final labels
 df = pd.DataFrame(final_demos).T
-df.to_parquet(C.out_dir / "icm_final_labels.parquet")
+df.to_parquet(out_dir / "icm_final_labels.parquet")
 
 df_labeled = df.dropna(subset='label').sort_values(by='score', key=np.abs, ascending=False)
 df_labeled_disagreed = df_labeled[df_labeled['vanilla_label'] != df_labeled['label']]
@@ -435,11 +465,14 @@ print(df_labeled_disagreed[['consistency_id', 'label', 'vanilla_label', 'score',
 for uid, row in df_labeled_disagreed.iterrows():
     print(f"\n## Candidate: {row['prompt']}\nICM Set: {'A' if row['label']==1 else 'B'}, Vanilla Set: {'A' if row['vanilla_label']==1 else 'B'}, score={row['score']}\n")
 
-
+print(f"\nFinal labeled examples saved to {out_dir / 'icm_final_labels.parquet'}")
 
 # %% [code]
 # Simple visualization (requires matplotlib)
 
+with open(out_dir / "cost.txt", "w") as f:
+    f.write(f"\n\nTotal cost: ${total_cost:.4f}\n")
+    f.write(reasoning_log)
 
 plt.figure(figsize=(10, 4))
 plt.subplot(1, 2, 1)
@@ -450,7 +483,7 @@ plt.ylabel('Energy')
 
 plt.subplot(1, 2, 2)
 plt.plot(accuracies)
-plt.title('Accuracy over Iterations')
+plt.title('Accuracy [labelled] over Iterations')
 plt.xlabel('Iteration')
 plt.ylabel('Accuracy')
 
