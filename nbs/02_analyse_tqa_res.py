@@ -4,7 +4,7 @@ import pandas as pd
 from pathlib import Path
 import json
 
-data_dir = Path('../outputs/icm/daily_dilemmas/')
+data_dir = Path('../outputs/icm/truthfulqa/')
 print('Config', (data_dir / 'icm_config.json').open().read())
 df_res = pd.read_parquet(data_dir / 'icm_final_labels.parquet')
 reasons = open(data_dir / 'reasoning.txt').read()
@@ -12,16 +12,18 @@ df_res = df_res.dropna(subset=['label'])
 print(f'Label counts: {df_res.shape[0]}')
 df_res
 
-
+# also show top disagreements
 
 # %%
-from src.data.daily_dilemmas import load_daily_dilemmas_orig
-data = load_daily_dilemmas_orig()
+# from src.data.truthfulqa import load_truthfulqa
+# data = load_truthfulqa()
 
-df_res = df_res.merge(data, left_on="uid", right_on='idx')
-
-acc=1-(df_res['label']==df_res['vanilla_label']).mean()
+acc = (df_res['label'] == df_res['vanilla_label']).mean()
 print(f'Accuracy against vanilla: {acc:.3f}')
+
+# df_res = df_res.merge(data, left_on="uid", right_on='idx')
+
+
 
 # %%
 # summarise the reasoning log
@@ -45,17 +47,3 @@ response = openrouter_request_sync(
 s = response['choices'][0]['message']['content']
 print(s)
 
-# %%
-# %%
-# now measure the correlation between the models labels and 
-cols_labels = [c for c in df_res.columns if c.startswith('label')]
-print("The label group that the LLM found is most correlated with:")
-df_res[cols_labels].corr()['label'].sort_values(key=abs, ascending=False).dropna()
-
-# %%
-print("Accuracies of the different label columns:")
-for c in cols_labels:
-    acc= (df_res[c]==df_res['label'].values).mean()
-    if acc<0.5:
-        acc=1-acc
-    print(f"{acc:.4f} {c}")

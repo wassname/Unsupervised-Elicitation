@@ -24,6 +24,7 @@ import asyncio
 from aiocache import cached
 from itertools import combinations
 from copy import deepcopy
+import signal
 
 try:
     from IPython import get_ipython
@@ -44,25 +45,38 @@ logger.add(sys.stderr, format="<green>{time:YYYY-MM-DD HH:mm}</green> | <level>{
 # Global cost tracker
 total_cost = 0.0
 reasoning_log = ""
+shutdown_requested = False
+
+def signal_handler(signum, frame):
+    global shutdown_requested
+    shutdown_requested = True
+    logger.info("Shutdown requested (Ctrl+C), will finish current iteration and save results...")
+
+signal.signal(signal.SIGINT, signal_handler)
 
 # %% [code]
 
 @dataclass
 class Config:
-    alpha: float = 30.0
-    initial_t: float = 10.0
-    final_t: float = 0.01
-    decay_rate: float = 0.99
-    beta: float = 2.0
-    num_seed: int = 8
+    alpha: float = 30.0 # Weight for logprob in energy vs consistency
+    initial_t: float = 10.0 # Initial temperature for annealing
+    final_t: float = 0.01  # Final temperature for annealing
+    beta: float = 2.0 # controls cooling schedule
+    num_seed: int = 42
+
+    semantic_anchor: str = "" # if we want to nudge the model towards a labelling dimension we can give it a clue
+
     max_iters: int = 2500  # should be at least dataset size X 2
-    n_shots: int = 6  # Number of in-context examples
-    # model_id: str = "meta-llama/llama-3.1-8b-instruct"  # Logprobs supported
-    model_id: str = "qwen/qwen3-235b-a22b-2507"  # Logprobs supported
-    provider_whitelist: Tuple[str] = ('Chutes','Nebius',)  # None to let OpenRouter choose
-    out_dir: Path = Path("../outputs/icm")  # Directory to save outputs
     log_interval: int = 100  # Log progress every N iterations
+
+    n_shots: int = 6  # Number of in-context examples
+    batch_size: int = 5  # Parallel predictions per iteration
     dataset: Literal["truthfulqa", "daily_dilemmas"] = "truthfulqa"  # Dataset name for logging
+    # model_id: str = "meta-llama/llama-3.1-8b-instruct"  # Logprobs supported
+    model_id: str = "qwen/qwen3-235b-a22b-2507"  # Need a openrouter model with Logprobs supported. "meta-llama/llama-3.1-8b-instruct, qwen/qwen3-235b-a22b-2507", "qwen/qwen3-30b-a3b-instruct-2507"
+    provider_whitelist: Tuple[str] = ('Chutes','Nebius',)  # None to let OpenRouter choose
+
+    out_dir: Path = Path("./outputs/icm")  # Directory to save outputs
 
 
 import simple_parsing
@@ -94,12 +108,12 @@ with open(out_dir / "icm_config.json", "w") as f:
 
 # %% [code]
 from src.data.truthfulqa import load_truthfulqa, is_consistent
-from data.daily_dilemmas import load_daily_dilemma
+from data.daily_dilemmas import load_daily_dilemmas
 
 if C.dataset == "truthfulqa":
     data = load_truthfulqa()
 elif C.dataset == "daily_dilemmas":
-    data = load_daily_dilemma()
+    data = load_daily_dilemmas()
 else:
     raise ValueError(f"Unknown dataset {C.dataset}")
 
@@ -148,7 +162,9 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False, all
 
     relevant_demos = relevant_demos[:C.n_shots]  # Cap total
 
-    instruction = "Examine these examples and complete the pattern for the new one.\n\n"
+    instruction = "Examine these examples of paired (Candidate, Set) and complete the pattern for the new one.\n\n"
+    if C.semantic_anchor:
+        instruction += f"Hint: The Sets relate to the dimension: {C.semantic_anchor}\n\n"
     fewshot = []
     for demo in relevant_demos:
         label_str = "A" if demo['label'] == 1 else "B"
@@ -185,17 +201,19 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False, all
         logger.info(f"--- End Debug ---")
         if verbose>1:
             global reasoning_log
-            reasoning_log += f"\n\n## Candidate:\n{target_prompt}\n## Set:\n"
-            reasoning_log += response['choices'][0]['message']['content']
+            # reasoning_log += f"\n\n## Candidate:\n{target_prompt}\n## Set:\n"
+            #@ TODO record iter
+            labeled = [v for v in current_demos.values() if v['label'] is not None]
+            reasoning_log += f"""
+Reasoning for UID {example_uid}, labelled {len(labeled)}:
+{response['choices'][0]['message']['content']}\n\n
+"""
 
-        
     try:
         choice_strs = ["A", "B"]
         choice_logp, top_logp = get_logprobs_choices(response, choice_strs, lower=False)
 
-
         choice_in_toplogp = any([s for s in choice_strs if s in top_logp])
-
 
         if not choice_in_toplogp:
             model_response = response['choices'][0]['message']['content']
@@ -349,6 +367,10 @@ async def run_icm(demonstrations, config=C):
     
     try:
         for iter in range(config.max_iters):
+            if shutdown_requested:
+                logger.info("Graceful shutdown at iteration {}", iter)
+                break
+            
             # Weighted sampling for inconsistent groups
             groups = {}
             all_uids = list(demonstrations.keys())
@@ -386,42 +408,56 @@ async def run_icm(demonstrations, config=C):
                         for uid in group_uids:
                             idx = all_uids.index(uid)
                             weights[idx] = 0.1
-            # TODO: Weight by potential energy delta: for candidates, temp-assign/predict label, compute delta U vs current, prioritize high positive delta (improves over score; low complexity, med value).
             
             weights = [max(w, 0.01) for w in weights]
-            example_uid = random.choices(all_uids, weights=weights)[0]
             
-            # Predict new label
-            if iter%100==0:
-                verbose = 1
-            elif iter%100==1:
-                verbose = 2
-            else:
-                verbose = 0
-            new_label, score = await predict_label(example_uid, current_labeled, config, verbose=verbose, all_demos=demonstrations)
-
-            # Update with new label and fix any inconsistencies ONLY if label changed
-            temp_demos = deepcopy(demonstrations)
-            temp_demos[example_uid]['label'] = new_label
-            temp_demos[example_uid]['score'] = score
+            # Batch predictions: sample multiple candidates, predict in parallel, pick best by energy delta
+            candidate_uids = random.choices(all_uids, weights=weights, k=min(config.batch_size, len(all_uids)))
+            candidate_uids = list(set(candidate_uids))  # Dedupe
             
-            # Only fix inconsistencies if the label actually changed
-            if demonstrations[example_uid]['label'] != new_label:
-                temp_demos = await fix_inconsistencies_greedy(temp_demos, config)
+            # Predict in parallel
+            verbose = 1 if iter % 100 == 0 else (2 if iter % 100 == 1 else 0)
+            tasks = [predict_label(uid, current_labeled, config, verbose=verbose, all_demos=demonstrations) 
+                     for uid in candidate_uids]
+            results = await asyncio.gather(*tasks)
             
-            # Compute new energy
-            new_energy, new_metrics = compute_energy(temp_demos, config)
-            delta = new_energy - old_energy
-            temp_demos[example_uid]['deltaE'] = delta
+            # Evaluate each candidate's energy delta
+            best_uid = None
+            best_delta = float('-inf')
+            best_temp_demos = None
+            
+            for uid, (new_label, score) in zip(candidate_uids, results):
+                temp_demos = deepcopy(demonstrations)
+                temp_demos[uid]['label'] = new_label
+                temp_demos[uid]['score'] = score
+                
+                # Fix inconsistencies if label changed
+                if demonstrations[uid]['label'] != new_label:
+                    temp_demos = await fix_inconsistencies_greedy(temp_demos, config)
+                
+                new_energy, _ = compute_energy(temp_demos, config)
+                delta = new_energy - old_energy
+                
+                if delta > best_delta:
+                    best_delta = delta
+                    best_uid = uid
+                    best_temp_demos = temp_demos
+            
+            # Apply best candidate
+            if best_temp_demos is None:
+                continue  # Skip if no valid candidates
+            
+            new_energy, new_metrics = compute_energy(best_temp_demos, config)
+            delta = best_delta
             
             # Annealing decision
             T = max(config.final_t, config.initial_t / (1 + config.beta * math.log(1 + iter)))
             accept_msg = f"Delta: {delta:.2f}, T: {T:.2f}, Acc: {new_metrics['accuracy']:.2f}"
             if delta > 0 or random.random() < math.exp(delta / T):
-                demonstrations = temp_demos
+                demonstrations = best_temp_demos
                 old_energy = new_energy
                 current_labeled = {k: v for k, v in demonstrations.items() if v['label'] is not None}
-                logger.debug("Iter {}: Accepted. Energy: {:.2f}. {}", iter, old_energy, accept_msg)
+                logger.debug("Iter {}: Accepted UID {}. Energy: {:.2f}. {}", iter, best_uid, old_energy, accept_msg)
             else:
                 logger.debug("Iter {}: Rejected. {}", iter, accept_msg)
             
@@ -440,7 +476,13 @@ async def run_icm(demonstrations, config=C):
 
 # %% [code]
 # Run the algorithm
-final_demos, energies, accuracies = asyncio.run(run_icm(demonstrations, C))
+try:
+    final_demos, energies, accuracies = asyncio.run(run_icm(demonstrations, C))
+except Exception as e:
+    logger.exception(f"Error during ICM run: {e}")
+    final_demos = demonstrations
+    energies = []
+    accuracies = [np.nan]
 
 # Final metrics
 final_energy, final_metrics = compute_energy(final_demos, C)
@@ -470,7 +512,7 @@ print(f"\nFinal labeled examples saved to {out_dir / 'icm_final_labels.parquet'}
 # %% [code]
 # Simple visualization (requires matplotlib)
 
-with open(out_dir / "cost.txt", "w") as f:
+with open(out_dir / "reasoning.txt", "w") as f:
     f.write(f"\n\nTotal cost: ${total_cost:.4f}\n")
     f.write(reasoning_log)
 
@@ -488,7 +530,7 @@ plt.xlabel('Iteration')
 plt.ylabel('Accuracy')
 
 plt.tight_layout()
-plt.savefig("icm_progress.png")
+plt.savefig(out_dir / "icm_progress.png")
 plt.show()
 
 

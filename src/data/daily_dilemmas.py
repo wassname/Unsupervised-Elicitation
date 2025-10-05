@@ -10,7 +10,7 @@ def convert_values_to_list(x):
     v = ast.literal_eval(s)
     return {"values_aggregated": v}
 
-def load_daily_dilemma(label_col = "label_Virtue/Truthfulness"):
+def load_daily_dilemmas_orig():
     dataset = load_dataset("kellycyy/daily_dilemmas", split="test")
     dataset = dataset.map(convert_values_to_list)
     df_labels = load_labels(dataset).rename(columns=lambda x: f"label_{x}" if x != "dilemma_idx" else x)
@@ -19,9 +19,13 @@ def load_daily_dilemma(label_col = "label_Virtue/Truthfulness"):
     cols_label = [c for c in df_labels.columns if c.startswith('label_')]
     # flip labels on not_to_do
     df.loc[df['action_type'] == 'not_to_do', cols_label] *= -1
+    return df
+    
+
+def load_daily_dilemmas(label_col = "label_Virtue/Truthfulness"):
+    print(f"Loading Daily Dilemmas with label column {label_col}")
+    df = load_daily_dilemmas_orig()
     dataset = df.to_dict(orient='records')
-    
-    
     
     data = []
     for item in dataset:

@@ -52,6 +52,78 @@ Example Output
     1. **Candidate 1**:  
       - Q: Do people learn faster when information is presented in their
 
+
+## Example output for DailyDilemmas
+
+  Config {
+    "alpha": 30.0,
+    "initial_t": 10.0,
+    "final_t": 0.01,
+    "beta": 2.0,
+    "num_seed": 42,
+    "semantic_anchor": "virtue",
+    "max_iters": 2500,
+    "log_interval": 100,
+    "n_shots": 6,
+    "batch_size": 5,
+    "dataset": "daily_dilemmas",
+    "model_id": "qwen/qwen3-235b-a22b-2507",
+    "provider_whitelist": [
+      "Chutes",
+      "Nebius"
+    ],
+    "out_dir": "outputs/icm"
+  }
+  Label counts: 1387
+
+  By roughly the middle of the log it converged on the cleaner dichotomy above:  
+    – A = “restraint / self-care / principle-keeping”  
+    – B = “assertive / duty-bound / risk-taking for a moral end”  
+
+  By roughly the middle of the log it converged on the cleaner dichotomy above:  
+    – A = “restraint / self-care / principle-keeping”  
+    – B = “assertive / duty-bound / risk-taking for a moral end”  
+
+  Accuracies of the different label columns:
+  
+  0.8486 label_WVS/Traditional
+  0.8774 label_WVS/Secular-rational
+  0.8226 label_WVS/Survival
+  0.8032 label_WVS/Self-expression
+  0.8327 label_MFT/Fairness
+  0.8125 label_MFT/Authority
+  0.8544 label_MFT/Loyalty
+  0.8183 label_MFT/Care
+  0.9135 label_Virtue/Truthfulness
+  0.8003 label_Emotion/trust
+  0.9870 label_Emotion/submission
+  0.7866 label_Maslow/self-esteem
+  0.8363 label_Maslow/safety
+  0.8017 label_Maslow/love and belonging
+  0.8702 label_Maslow/self-actualization
+  0.9589 label_Virtue/Courage
+  0.9430 label_Virtue/Patience
+  0.9301 label_Emotion/anticipation
+  0.9553 label_Emotion/joy
+  0.9776 label_Emotion/sadness
+  0.9748 label_Maslow/physiological
+  0.9740 label_MFT/Purity
+  0.9668 label_Emotion/optimism
+  0.9776 label_Emotion/love
+  0.9877 label_Virtue/Liberality
+  0.9798 label_Emotion/fear
+  0.9957 label_Virtue/Ambition
+  0.9863 label_Emotion/disgust
+  0.9986 label_Emotion/contempt
+  0.9913 label_Virtue/Friendliness
+  0.9928 label_Emotion/anger
+  0.9993 label_Emotion/remorse
+  0.9921 label_Virtue/Temperance
+  0.9986 label_Emotion/disapproval
+  0.9957 label_Virtue/Modesty
+  0.9993 label_Emotion/aggressiveness
+  0.9986 label_Virtue/Righteous Indignation
+
 Original readme
 ----
 ## Unsupervised Elicitation of Language Models
