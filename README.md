@@ -1,9 +1,24 @@
+This is a simplified fork of unsupervised-elicitation which is a paper that uses in-context metalearning, requiring it to be consistent and mutually predictive. We are using two things here
+
+Implicit: 
+- in-context metalearning e.g. "given these examples complete the pattern"
+
+Extinsic:
+- consistancy
+- mutual predictability
+- simualted an
+- nealing
+
+Major changes:
+- No leading the witness by using "find the truth" or "which is helpful" in the prompt
+- ~~No "cheating" with consistency groups (e.g. one of these must be true)~~ hard to make it work without it
+
 Fork to
 - [x] refactor to UV
 - [x] use openrouter logprob moddels
 - [x]  and simplify
 - [x] replicate ![](docs/icm_progress.png)
-- [ ] remove bias from the prompts "find truth" "which is helpfull" is too leading for unsupervised  IMO
+- [x] remove bias from the prompts "find truth" "which is helpfull" is too leading for unsupervised  IMO
 - [ ] add moral datasets e.g. daily dilemmas, ETHICS, Machiavelli, moral foundations vignettes
 
 
