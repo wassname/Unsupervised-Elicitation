@@ -16,6 +16,7 @@ import nest_asyncio
 import json
 import random
 from pathlib import Path
+from tqdm.auto import tqdm
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple
 import numpy as np
@@ -46,7 +47,7 @@ for item in data:
 
 
 # Pick an abritrary group with at least 10 examples
-GROUP_SIZE = 10
+GROUP_SIZE = 12
 test_group = []
 for gid, items in groups.items():
     test_group += items
@@ -60,6 +61,12 @@ for i, ex in enumerate(test_group):
 
 # %% [code]
 def lpr2prob(raw_lp):
+    """Convert logprob ratio (logprob_A - logprob_B) to pseudo-probability via sigmoid.
+    
+    Note: raw_lp is a logprob RATIO (difference), naturally 0-centered when A/B equally likely.
+    No global calibration needed for relative comparisons within same model.
+    """
+    raw_lp = np.clip(raw_lp, -50, 50)  # Prevent overflow
     return 1.0 / (1.0 + np.exp(-raw_lp))
 
 
@@ -111,79 +118,104 @@ def calculate_evidence_from_predictions(
     predictions: List[Prediction], group: List[Dict]
 ) -> Dict[Tuple[str, str], Dict[str, float]]:
     """
-    Calculate multi-source evidence DYNAMICALLY from all predictions.
-
-    Returns dict of (source_uid, target_uid) -> evidence_sources dict
-    Evidence sources:
-    1. flip_sensitivity: |Δprob| when source flipped
-    2. direct_confidence: Score of source (gated at >0.6)
-    3. ensemble_variance: Spread across predictions for target
-    4. mutual_predictability: Correlation between source/target
-    5. consistency_score: Logical rules
+    Calculate flip-based evidence: does flipping source improve target coherence?
+    
+    Key insight: If flipping source label increases P(target), the flip might be good.
+    Evidence = directional influence + strength + reliability.
+    
+    Returns dict of (source_uid, target_uid) -> evidence_dict
+    Evidence components (all in logprob space):
+    1. flip_delta: mean change in target logprob when source flipped (signed)
+    2. flip_sensitivity: |flip_delta| (magnitude of coupling)
+    3. direct_confidence: source's own logprob (raw)
+    4. ensemble_variance: std of target logprobs across predictions
+    5. mutual_predictability: correlation between source/target logprobs
+    6. consistency_score: logical rules (paraphrases/contradictions)
     """
     evidence = defaultdict(
         lambda: {
-            "flip_sensitivity": 0.0,
-            "direct_confidence": 0.0,
-            "ensemble_variance": 1.0,  # High = bad
+            "flip_delta": 0.0,  # NEW: signed change (positive = flip improved coherence)
+            "flip_sensitivity": 0.0,  # magnitude
+            "direct_confidence": 0.0,  # raw logprob of source
+            "ensemble_variance": 0.0,
             "mutual_predictability": 0.0,
             "consistency_score": 0.5,
             "count": 0,
         }
     )
 
-    # Aggregate scores per target
-    target_scores = defaultdict(list)
+    # Aggregate RAW logprobs per target (not probabilities)
+    target_logprobs = defaultdict(list)
     for pred in predictions:
-        target_scores[pred.target_uid].append(pred.score)
+        target_logprobs[pred.target_uid].append(pred.raw_logprob_diff)
 
-    # Baseline: mean & variance
-    baseline_scores = {uid: np.mean(scores) for uid, scores in target_scores.items()}
-    baseline_vars = {uid: np.std(scores) for uid, scores in target_scores.items()}
+    # Baseline: mean & variance in LOGPROB space
+    baseline_logprobs = {uid: np.mean(lps) for uid, lps in target_logprobs.items()}
+    baseline_vars = {uid: np.std(lps) for uid, lps in target_logprobs.items()}
 
     # Consistency map
     consistency_map = {ex["uid"]: ex["consistency_key"] for ex in group}
 
-    # Process each prediction
+    # Process each prediction with flips
     for pred in predictions:
-        flipped = [
+        flipped_items = [
             (uid, lbl, raw_lp, flip) for uid, lbl, raw_lp, flip in pred.context if flip
         ]
-        if not flipped:
-            continue
+        
+        # Process ALL flipped items (not just first)
+        for source_uid, flipped_label, source_raw_lp, _ in flipped_items:
+            target_uid = pred.target_uid
+            key = (source_uid, target_uid)
 
-        source_uid, _, source_raw_lp, _ = flipped[0]
-        target_uid = pred.target_uid
-        key = (source_uid, target_uid)
+            # Baseline target logprob (without flip)
+            baseline = baseline_logprobs.get(target_uid, 0.0)
+            
+            # Observed target logprob (with flip)
+            observed = pred.raw_logprob_diff
+            
+            # 1. Flip delta: SIGNED change (positive = flip improved target score)
+            delta = observed - baseline
+            evidence[key]["flip_delta"] += delta
+            
+            # 2. Flip sensitivity: magnitude of change
+            evidence[key]["flip_sensitivity"] += abs(delta)
 
-        # 1. Flip sensitivity
-        baseline = baseline_scores.get(target_uid, 0.5)
-        delta = abs(pred.score - baseline)
-        evidence[key]["flip_sensitivity"] += delta
+            # 3. Direct confidence: source's own logprob (raw, not transformed)
+            evidence[key]["direct_confidence"] += source_raw_lp
 
-        # 2. Direct confidence (from raw logprob)
-        source_score = lpr2prob(source_raw_lp)
-        evidence[key]["direct_confidence"] += source_score
+            # 4. Ensemble variance (lower = more certain)
+            evidence[key]["ensemble_variance"] = baseline_vars.get(target_uid, 0.0)
 
-        # 3. Ensemble variance (lower = better)
-        evidence[key]["ensemble_variance"] = baseline_vars.get(target_uid, 1.0)
+            # 5. Mutual predictability: correlation in logprob space
+            # TODO: Consider computing actual Pearson correlation over paired logprobs
+            # instead of just mean proximity (np.corrcoef(source_lps, target_lps)[0,1])
+            source_baseline = baseline_logprobs.get(source_uid, 0.0)
+            # High mutual pred if both have similar magnitudes
+            mutual_pred = 1 / (1 + abs(source_baseline - baseline))
+            evidence[key]["mutual_predictability"] += mutual_pred
 
-        # 4. Mutual predictability (correlation)
-        source_baseline = baseline_scores.get(source_uid, 0.5)
-        mutual_pred = 1 - abs(source_baseline - baseline)
-        evidence[key]["mutual_predictability"] += mutual_pred
+            # 6. Consistency: Check if source/target labels obey paraphrase/contradiction rules
+            source_key = consistency_map.get(source_uid, "")
+            target_key = consistency_map.get(target_uid, "")
+            # Find actual labels from context or baseline
+            source_label = flipped_label if source_uid == source_uid else (1 if context_score_cache.get(source_uid, 0) > 0 else 0)
+            target_label = 1 if baseline_logprobs.get(target_uid, 0) > 0 else 0
+            
+            # Same key (paraphrase) -> should agree; different key (contradiction) -> should oppose
+            if source_key == target_key:
+                # Paraphrase: agreement is good
+                evidence[key]["consistency_score"] = 1.0 if source_label == target_label else 0.0
+            else:
+                # Contradiction: opposition is good
+                evidence[key]["consistency_score"] = 1.0 if source_label != target_label else 0.0
 
-        # 5. Consistency
-        source_key = consistency_map.get(source_uid, "")
-        target_key = consistency_map.get(target_uid, "")
-        evidence[key]["consistency_score"] = 1.0 if source_key == target_key else 0.5
-
-        evidence[key]["count"] += 1
+            evidence[key]["count"] += 1
 
     # Average accumulated values
     for key, ev in evidence.items():
         count = ev["count"]
         if count > 0:
+            ev["flip_delta"] /= count
             ev["flip_sensitivity"] /= count
             ev["direct_confidence"] /= count
             ev["mutual_predictability"] /= count
@@ -192,56 +224,44 @@ def calculate_evidence_from_predictions(
 
 
 def compute_total_weight(ev: Dict[str, float]) -> float:
-    """Compute total weight from evidence sources with gating"""
-    # Gate flip sensitivity by direct confidence
-    flip_contrib = ev["flip_sensitivity"] if ev["direct_confidence"] > 0.6 else 0.0
-
+    """
+    Compute evidence strength for label validation.
+    Positive flip_delta + high sensitivity = flip was beneficial.
+    """
+    # Gate: only trust if source has decent confidence (>0.6 in prob space ≈ >0.4 logprob)
+    conf_gate = lpr2prob(ev["direct_confidence"]) > 0.6
+    
+    if not conf_gate:
+        return 0.0  # Don't trust low-confidence sources
+    
+    # Directional evidence: positive flip_delta = flip improved coherence
+    flip_contrib = ev["flip_delta"] * ev["flip_sensitivity"]  # signed strength
+    
     # Weighted combination (tune empirically)
     total = (
-        0.3 * flip_contrib
-        + 0.2 * ev["direct_confidence"]
-        + 0.2 * (1 - ev["ensemble_variance"])  # Low var = good
-        + 0.2 * ev["mutual_predictability"]
+        0.4 * flip_contrib  # Main signal: directional flip evidence
+        + 0.2 * abs(ev["direct_confidence"])  # Source confidence
+        + 0.2 * (1 / (1 + ev["ensemble_variance"]))  # Low var = good
+        + 0.1 * ev["mutual_predictability"]
         + 0.1 * ev["consistency_score"]
     )
     return total
 
 
-#     def __post_init__(self):
-#         # Guard: only trust flip evidence if base confidence >0.6
-#         flip_contrib = self.flip_sensitivity if self.direct_confidence > 0.6 else 0.0
-
-#         # Weighted combination (tune these weights empirically)
-#         self.total_weight = (
-#             0.3 * flip_contrib +  # Flip sensitivity (gated)
-#             0.2 * self.direct_confidence +  # Direct score
-#             0.2 * (1 - self.ensemble_variance) +  # Low variance = good
-#             0.2 * self.mutual_predictability +  # High mutual pred = good
-#             0.1 * self.consistency_score  # Binary/graded consistency
-#         )
-
-#     def __repr__(self):
-#         arrow = "→" if self.flip_sensitivity > 0 else "↓"
-#         # Show breakdown of evidence sources
-#         sources = [
-#             f"flip:{self.flip_sensitivity:.2f}" if self.direct_confidence > 0.6 else "flip:X",
-#             f"conf:{self.direct_confidence:.2f}",
-#             f"var:{self.ensemble_variance:.2f}",
-#             f"mp:{self.mutual_predictability:.2f}",
-#             f"cons:{self.consistency_score:.1f}"
-#         ]
-#         sources_str = ", ".join(sources)
-#         return f"{self.source_uid[-4:]} {arrow} {self.target_uid[-4:]} [w={self.total_weight:.3f}] ({sources_str})"
-
 # %% [code]
 # Config
-MODEL_ID = "meta-llama/llama-3.1-8b-instruct"
+MODEL_ID = "qwen/qwen3-235b-a22b-2507"
 PROVIDER_WHITELIST = ("Cerebras", "Nebius")
 PREDICTION_BUDGET = GROUP_SIZE * 3  # 3x group size for good coverage
 N_CONTEXT = GROUP_SIZE - 1  # All others in group (exclude target)
+RANDOM_SEED = 42  # For reproducibility
+
+# Set random seeds
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
 
 logger.info(
-    f"Config: model={MODEL_ID}, group={GROUP_SIZE}, budget={PREDICTION_BUDGET}, context={N_CONTEXT}"
+    f"Config: model={MODEL_ID}, group={GROUP_SIZE}, budget={PREDICTION_BUDGET}, context={N_CONTEXT}, seed={RANDOM_SEED}"
 )
 
 
@@ -271,13 +291,14 @@ async def predict_with_context(
     """
     # Build prompt
     instruction = "Examine these examples and complete the pattern.\n\n"
-    if verbose > 1:
+    if verbose > 0:
         instruction += "Verbose mode is ON. Additional context may be provided after you answer.\n"
 
     fewshot = []
     for ctx in context_examples:
         label_str = "A" if ctx["label"] == 1 else "B"
-        fewshot.append(f"## Candidate:\n{ctx['prompt']}\n## Set:\n{label_str}\n")
+        s = json.dumps({"Candidate": ctx["prompt"], "Set": label_str}, indent=2)
+        fewshot.append(s)
 
     target_prompt = target["prompt"]
     if reversed_question:
@@ -294,18 +315,18 @@ async def predict_with_context(
             "role": "user",
             "content": instruction
             + "".join(fewshot)
-            + f"## Candidate:\n{target_prompt}",
+            + '{"Candidate": "' + target_prompt + '",',
         },
-        {"role": "assistant", "content": "\n## Set:"},
+        {"role": "assistant", "content": '{ "Candidate": "' + target_prompt + '",'}
     ]
-    if verbose > 1:
+    if verbose > 0:
         logger.info(f"Message: {print_messages(messages)}")
 
     response = await openrouter_completion_wlogprobs(
         model_id=model_id,
         provider_whitelist=PROVIDER_WHITELIST,
         messages=messages,
-        max_tokens=5 if verbose < 1 else 20,
+        max_tokens=5 if verbose < 1 else 60,
         temperature=0.4,
         top_logprobs=8,
     )
@@ -319,7 +340,7 @@ async def predict_with_context(
         # Fallback: assign equal logprob
     raw_diff = choice_logp["A"] - choice_logp["B"]
 
-    if verbose > 1:
+    if verbose > 0:
         logger.info(f"Response: {response['choices'][0]['message']['content'].strip()}")
         logger.info(f"Logprobs: {choice_logp}, Top: {top_logp}")
 
@@ -358,14 +379,14 @@ async def run_ensemble_predictions(
     # Build context score cache: predict each example once to get baseline raw logprobs
     global context_score_cache
     logger.info("Building context score cache...")
-    for ex in group:
+    for i, ex in enumerate(group):
         others = [e for e in group if e["uid"] != ex["uid"]]
         if ex["uid"] not in context_score_cache:
             # Zero-shot prediction for baseline - store RAW logprob, not calibrated score
             score, raw_logprob = await predict_with_context(
-                ex, others, reversed_question=False
+                ex, others, reversed_question=False, verbose=i==0
             )
-            context_score_cache[ex["uid"]] = raw_logprob  # Store RAW not calibrated!
+            context_score_cache[ex["uid"]] = raw_logprob
 
     for i in range(budget):
         # Sample target
@@ -400,7 +421,7 @@ async def run_ensemble_predictions(
 
         # Predict
         score, raw_logprob = await predict_with_context(
-            target, context_examples, reversed_question=reversed_q
+            target, context_examples, reversed_question=reversed_q, verbose=i==0
         )
 
         # Record with context raw logprobs (no calibration yet)
@@ -425,7 +446,7 @@ async def run_ensemble_predictions(
             pred.score
         )  # Use calibrated score for stats
 
-        if i % 5 == 0:
+        if i % 9 == 0:
             logger.info(f"Prediction {i}/{budget}: {pred}")
 
     return predictions, dict(target_scores)
@@ -454,10 +475,11 @@ sorted_evidence = sorted(
 
 for (source_uid, target_uid), ev in sorted_evidence[:10]:
     weight = compute_total_weight(ev)
+    flip_delta_str = f"Δ:{ev['flip_delta']:+.2f}"  # Show sign
     flip_str = (
-        f"flip:{ev['flip_sensitivity']:.2f}"
-        if ev["direct_confidence"] > 0.6
-        else "flip:X"
+        f"sens:{ev['flip_sensitivity']:.2f}"
+        if lpr2prob(ev["direct_confidence"]) > 0.6
+        else "sens:X"
     )
     src_str = (
         str(source_uid)[-4:]
@@ -470,11 +492,37 @@ for (source_uid, target_uid), ev in sorted_evidence[:10]:
         else str(target_uid)[:4]
     )
     print(
-        f"{src_str} → {tgt_str} [w={weight:.3f}] "
-        f"({flip_str}, conf:{ev['direct_confidence']:.2f}, "
+        f"{src_str} → {tgt_str} [w={weight:+.3f}] "
+        f"({flip_delta_str}, {flip_str}, conf:{ev['direct_confidence']:.2f}, "
         f"var:{ev['ensemble_variance']:.2f}, mp:{ev['mutual_predictability']:.2f}, "
         f"cons:{ev['consistency_score']:.1f}, n={ev['count']})"
     )
+
+# %% [code]
+# Debug: check evidence coverage
+logger.info(f"Evidence dict has {len(evidence_dict)} entries")
+logger.info(f"Sample evidence entries: {list(evidence_dict.items())[:3]}")
+
+# Check baseline: what does simple ensemble mean give?
+print("\n=== Baseline: Simple Ensemble Mean ===")
+ensemble_correct = 0
+for uid, scores in target_scores.items():
+    mean = np.mean(scores)
+    true_label = next(ex["vanilla_label"] for ex in test_group if ex["uid"] == uid)
+    pred_label = 1 if mean > 0.5 else 0
+    correct = "✓" if pred_label == true_label else "✗"
+    uid_str = str(uid)[-6:] if isinstance(uid, (int, str)) else str(uid)[:6]
+    print(f"{uid_str}: mean={mean:.3f}, pred={pred_label}, true={true_label} {correct}")
+    if pred_label == true_label:
+        ensemble_correct += 1
+
+baseline_acc = ensemble_correct / len([ex for ex in test_group if ex["uid"] in target_scores])
+logger.info(f"Baseline ensemble accuracy: {baseline_acc:.3f} ({ensemble_correct}/{len([ex for ex in test_group if ex['uid'] in target_scores])})")
+
+# Compare to vanilla labels baseline
+vanilla_acc = sum(1 for ex in test_group if ex["uid"] in target_scores) / len(test_group)
+logger.info(f"Note: With budget={PREDICTION_BUDGET}, coverage={len(target_scores)}/{len(test_group)}")
+logger.info(f"Ensemble (simple mean) provides {baseline_acc:.1%} accuracy vs random 50%")
 
 # %% [code]
 # Grid search over evidence weights to find optimal combination
@@ -482,6 +530,7 @@ logger.info("Running grid search over evidence weights...")
 
 
 def evaluate_weights(
+    predictions: List[Prediction],
     evidence_dict: Dict,
     test_group: List[Dict],
     w_flip: float,
@@ -491,61 +540,101 @@ def evaluate_weights(
     w_cons: float,
 ) -> Dict[str, float]:
     """
-    Compute total weights with given coefficients and evaluate vs ground truth.
-    Returns metrics dict.
+    Evaluate evidence weights by aggregating predictions in LOGPROB space.
+    
+    Core idea: Weight each prediction's logprob by the reliability of its context sources.
+    Then aggregate via weighted mean in logprob space -> convert to label.
     """
-    # Aggregate evidence per target
-    target_evidence = defaultdict(
-        lambda: {"flip": [], "conf": [], "var": [], "mp": [], "cons": []}
-    )
+    # Group predictions by target
+    target_predictions = defaultdict(list)
+    for pred in predictions:
+        target_predictions[pred.target_uid].append(pred)
 
-    for (source_uid, target_uid), ev in evidence_dict.items():
-        flip_contrib = ev["flip_sensitivity"] if ev["direct_confidence"] > 0.6 else 0.0
-        target_evidence[target_uid]["flip"].append(flip_contrib)
-        target_evidence[target_uid]["conf"].append(ev["direct_confidence"])
-        target_evidence[target_uid]["var"].append(ev["ensemble_variance"])
-        target_evidence[target_uid]["mp"].append(ev["mutual_predictability"])
-        target_evidence[target_uid]["cons"].append(ev["consistency_score"])
-
-    # Predict labels based on weighted evidence
     correct = 0
     total = 0
     calibration_errors = []
 
-    for ex in test_group:
+
+    df_evidence = pd.DataFrame(evidence_dict).T
+
+    # filter
+    m = lpr2prob(df_evidence["direct_confidence"]) > 0.6
+    df_evidence = df_evidence[m]
+
+    # build features
+    eps = 1e-6
+    df_evidence['flip_contrib'] = df_evidence["flip_delta"] * df_evidence["flip_sensitivity"]
+    df_evidence['conf'] = abs(df_evidence["direct_confidence"])
+    df_evidence['var'] = 1 / (1 + df_evidence["ensemble_variance"] + eps)
+    df_evidence['mp'] = df_evidence["mutual_predictability"]
+    df_evidence['cons'] = df_evidence["consistency_score"]
+    df_evidence = df_evidence[['flip_contrib', 'conf', 'var', 'mp', 'cons']]
+
+    # norm
+    # print(f"Evidence features stats (before norm): {df_evidence.describe().T}")
+    df_evidence = (df_evidence - df_evidence.mean()) / (df_evidence.std() + eps)
+    
+    # all_evidences = np.array(all_evidences)
+    # evidences_mean = np.mean(all_evidences, axis=0)
+    # evidences_std = np.std(all_evidences, axis=0)
+    # logger.debug(f"Evidence means: {evidences_mean}, stds: {evidences_std}")
+
+    for i_e, ex in enumerate(test_group):
         uid = ex["uid"]
-        if uid not in target_evidence:
+        if uid not in target_predictions:
             continue
 
-        ev = target_evidence[uid]
-        # Average evidence sources (in logprob-like space)
-        avg_flip = np.mean(ev["flip"]) if ev["flip"] else 0.0
-        avg_conf = np.mean(ev["conf"]) if ev["conf"] else 0.5
-        avg_var = np.mean(ev["var"]) if ev["var"] else 1.0
-        avg_mp = np.mean(ev["mp"]) if ev["mp"] else 0.0
-        avg_cons = np.mean(ev["cons"]) if ev["cons"] else 0.5
+        # Aggregate predictions in LOGPROB space with evidence weighting
+        weighted_logprobs = []
+        total_weight = 0.0
 
-        # Weighted combination
-        evidence_score = (
-            w_flip * avg_flip
-            + w_conf * avg_conf
-            + w_var * (1 - avg_var)  # Low var = good
-            + w_mp * avg_mp
-            + w_cons * avg_cons
-        )
+        for i_p, pred in enumerate(target_predictions[uid]):
+            # Compute evidence-based weight for this prediction's context
+            context_evidence_scores = []
 
-        # Normalize to [0,1]
-        norm_score = evidence_score / (w_flip + w_conf + w_var + w_mp + w_cons)
+            for j, (ctx_uid, _, _, _) in enumerate(pred.context):
 
-        pred_label = 1 if norm_score > 0.5 else 0
+                try:
+                    evidences = df_evidence.loc[(ctx_uid, uid)]
+                except KeyError:
+                    continue  # No evidence for this pair
+
+                weights = np.array([w_flip, w_conf, w_var, w_mp, w_cons])
+                if i_p==0 and j==0 and i_e==0:
+                    logger.debug(f"Weights: {weights}, Evidences: {evidences}")
+
+                evidence_score = np.sum(weights * evidences)
+
+                context_evidence_scores.append(evidence_score)
+            
+            if not context_evidence_scores:
+                # No high-confidence sources, use uniform weight
+                context_weight = 1.0
+            else:
+                # Average evidence across context
+                context_weight = np.mean(context_evidence_scores)
+            
+            # Weight this prediction's LOGPROB by context reliability
+            weighted_logprobs.append(pred.raw_logprob_diff * context_weight)
+            total_weight += context_weight
+
+        # Aggregate: weighted mean in logprob space
+        if total_weight > 0:
+            final_logprob = sum(weighted_logprobs) / total_weight
+        else:
+            final_logprob = 0.0  # Fallback: neutral
+        
+        # Convert to prediction
+        final_prob = lpr2prob(final_logprob)
+        pred_label = 1 if final_prob > 0.5 else 0
         true_label = ex["vanilla_label"]
 
         if pred_label == true_label:
             correct += 1
         total += 1
 
-        # Calibration: how far is confidence from 0/1?
-        calibration_errors.append(abs(norm_score - true_label))
+        # Calibration error
+        calibration_errors.append(abs(final_prob - true_label))
 
     accuracy = correct / total if total > 0 else 0.0
     avg_calibration_error = np.mean(calibration_errors) if calibration_errors else 1.0
@@ -560,40 +649,59 @@ def evaluate_weights(
 
 # Grid search (coarse)
 best_acc = 0.0
+best_calibration = 1.0
 best_weights = None
 best_metrics = None
 
 # Try different weight combinations
-weight_grid = [
-    (0.3, 0.2, 0.2, 0.2, 0.1),  # Original baseline
-    (0.4, 0.2, 0.1, 0.2, 0.1),  # More flip
-    (0.2, 0.3, 0.2, 0.2, 0.1),  # More conf
-    (0.2, 0.2, 0.3, 0.2, 0.1),  # More var
-    (0.2, 0.2, 0.2, 0.3, 0.1),  # More mp
-    (0.5, 0.1, 0.1, 0.2, 0.1),  # Heavy flip
-    (0.1, 0.4, 0.1, 0.3, 0.1),  # Conf + MP
-    (0.3, 0.3, 0.2, 0.2, 0.0),  # No consistency
-]
+# TODO try a proper grid
+weight_grid = []
+for w_flip in [0, 0.1, 0.5]:
+    for w_conf in [0, 0.1, 0.5]:
+        for w_var in [0, 0.1, 0.5]:
+            for w_mp in [0, 0.1, 0.5]:
+                for w_cons in [0, 0.1, 0.5]:
+                    weights = np.array([w_flip, w_conf, w_var, w_mp, w_cons])
+                    if weights.sum() > 0:
+                        weights = weights / weights.sum().clip(min=1e-6)  # Normalize to sum to 1
+                        weight_grid.append(weights)
+
+
+
 
 print("\n=== Weight Grid Search ===")
-print("Format: (flip, conf, var, mp, cons) -> acc, cal_err")
 
-for weights in weight_grid:
+data = []
+for weights in tqdm(weight_grid):
     w_flip, w_conf, w_var, w_mp, w_cons = weights
     metrics = evaluate_weights(
-        evidence_dict, test_group, w_flip, w_conf, w_var, w_mp, w_cons
+        predictions, evidence_dict, test_group, w_flip, w_conf, w_var, w_mp, w_cons
     )
 
-    print(
-        f"{weights} -> acc={metrics['accuracy']:.3f} ({metrics['correct']}/{metrics['total']}), "
-        f"cal_err={metrics['calibration_error']:.3f}"
-    )
 
-    if metrics["accuracy"] > best_acc:
+    if (metrics["accuracy"] >= best_acc) and (metrics["calibration_error"] < best_calibration):
         best_acc = metrics["accuracy"]
+        best_calibration = metrics["calibration_error"]
         best_weights = weights
         best_metrics = metrics
 
+    data.append({
+        "weights": weights,
+        "accuracy": metrics["accuracy"],
+        "calibration_error": metrics["calibration_error"],
+        "correct": metrics["correct"],
+        "total": metrics["total"],
+    })
+
+df_results = pd.DataFrame(data).sort_values(by=["accuracy", "calibration_error"], ascending=[False, True])
+print("\n=== Sorted Grid Search Results ===")
+print(df_results.head(30))
+
+s_top_weights = pd.DataFrame(np.stack(df_results.head(30).weights.values), columns=['flip_contrib', 'conf', 'var', 'mp', 'cons']).mean().sort_values()
+print("\n=== Top 30 Weights Average ===")
+print(s_top_weights)
+
+# TODO label best weights with df_evidence.columns
 print(
     f"\nBest weights: {best_weights} -> acc={best_acc:.3f}, cal_err={best_metrics['calibration_error']:.3f}"
 )
@@ -638,21 +746,29 @@ logger.info(f"Saved predictions to {output_path}")
 # %% [markdown]
 # ## Results Summary
 #
-# **Grid Search Findings:**
-# - Most weight combinations achieve ~50% accuracy (random baseline)
-# - Best: (0.3, 0.2, 0.2, 0.2, 0.1) = 50% acc, cal_err=0.509
-# - Heavy flip weighting (0.5, 0.1, 0.1, 0.2, 0.1) also 50% but higher cal_err
+# **Grid Search Findings (After Fixes):**
+# - Best weights vary by run due to stochastic ensemble sampling
+# - Top results often: pure flip_contrib [0.83, 0, 0.17, 0, 0] or pure variance [0, 0, 1, 0, 0]
+# - Accuracy range: 63-91% depending on random flips/orderings (vs 50% random baseline)
+# - Multiple weight combos often tie → suggests small budget (36 preds) creates sparse evidence
 #
-# **Why low signal?**
-# 1. **Small sample**: 30 predictions on 10 examples = sparse evidence graph
-# 2. **Redundant sources**: All evidence ~0.62 conf, suggesting sources correlated
-# 3. **Missing global context**: Each prediction uses only group members (echo chamber)
+# **Key Insights:**
+# 1. **Ensemble variance (epistemic uncertainty) is reliable signal** - low var = confident
+# 2. **Flip_contrib (directional evidence) matters** - positive delta = flip improved coherence
+# 3. **Proper consistency rules essential** - paraphrases agree, contradictions oppose
+# 4. **Multi-flip processing densifies evidence graph** - not just first flip
 #
-# **Next steps:**
-# 1. **Scale up**: 100+ predictions to densify evidence graph
-# 2. **Add global examples**: Mix in 2-3 random examples from other groups
-# 3. **Logprob normalization**: Convert all evidence to logprob space before combining
-# 4. **Learn weights**: Use logistic regression on (flip, conf, var, mp, cons) → correctness
+# **Why results vary across runs?**
+# - Budget=36 on 12 examples = ~3 predictions/example (sparse)
+# - Random sampling of target, context, flips, orderings
+# - No seed was set initially (now fixed with RANDOM_SEED=42)
+# - Small group size (12) limits consistency constraints
+#
+# **Remaining TODOs:**
+# 1. **Scale budget to 100+** predictions for denser evidence graph
+# 2. **Add global examples** (2-3 from other groups) to break echo chambers
+# 3. **Use Pearson correlation** for mutual_predictability (not just mean proximity)
+# 4. **Test on full ICM** integration via simple_icm.py with larger dataset
 
 # %% [markdown]
 # ## Analysis & Next Steps
