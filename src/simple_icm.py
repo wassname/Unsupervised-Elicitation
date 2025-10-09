@@ -19,7 +19,7 @@ from dataclasses import dataclass, asdict
 import dotenv
 from loguru import logger
 from openrouter_wrapper.logprobs import openrouter_completion_wlogprobs, get_logprobs_choices, LogprobsNotSupportedError  # User's wrapper
-from typing import List, Tuple, Callable, Literal
+from typing import List, Optional, Tuple, Callable, Literal
 import asyncio
 from aiocache import cached
 from itertools import combinations
@@ -66,7 +66,7 @@ class Config:
 
     semantic_anchor: str = "" # if we want to nudge the model towards a labelling dimension we can give it a clue
 
-    max_iters: int = 2500  # should be at least dataset size X 2
+    max_iters: Optional[int] = None  # should be at least dataset size X 2
     log_interval: int = 100  # Log progress every N iterations
 
     n_shots: int = 6  # Number of in-context examples
@@ -82,6 +82,7 @@ class Config:
 import simple_parsing
 
 C: Config = simple_parsing.parse(Config)
+
 
 # C = Config(
 #     model_id="qwen/qwen3-235b-a22b-2507", # $0.2 0.6
@@ -118,6 +119,9 @@ else:
     raise ValueError(f"Unknown dataset {C.dataset}")
 
 logger.info("Loaded {} examples", len(data))
+
+if C.max_iters is None:
+    C.max_iters = len(data) * 4
 
 # %% [code]
 # Initialize: Random labels for first num_seed, None for others
