@@ -129,14 +129,14 @@ def initialize_data(data, config):
     demonstrations = {item['uid']: deepcopy(item) for item in data}
     labeled_uids = random.sample(list(demonstrations.keys()), min(config.num_seed, len(data)))
     for uid in demonstrations:
-        demonstrations[uid]['label'] = None
+        demonstrations[uid]['pred_label'] = None
         demonstrations[uid]['score'] = 0.0  # Will store prediction score
         if uid in labeled_uids:
-            demonstrations[uid]['label'] = random.choice([0, 1])
+            demonstrations[uid]['pred_label'] = random.choice([0, 1])
     return demonstrations
 
 demonstrations = initialize_data(data, C)
-logger.info("Initialized labels: {}", {k: v['label'] for k, v in demonstrations.items() if v['label'] is not None})
+logger.info("Initialized labels: {}", {k: v['pred_label'] for k, v in demonstrations.items() if v['pred_label'] is not None})
 
 # %% [code]
 # Predict label using in-context prompting
@@ -156,7 +156,7 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False, all
     # Group and interleave demos by consistency_id like original
     grouped_demos = {}
     for uid, demo in current_demos.items():
-        if uid != example_uid and demo['label'] is not None:
+        if uid != example_uid and demo['pred_label'] is not None:
             grouped_demos.setdefault(demo['consistency_id'], []).append(demo)
 
     relevant_demos = []
@@ -171,7 +171,7 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False, all
         instruction += f"Hint: The Sets relate to the dimension: {C.semantic_anchor}\n\n"
     fewshot = []
     for demo in relevant_demos:
-        label_str = "A" if demo['label'] == 1 else "B"
+        label_str = "A" if demo['pred_label'] == 1 else "B"
         fewshot.append(f"\n\n## Candidate:\n{demo['prompt']}\n## Set:\n{label_str}")
 
     # Use all_demos if provided (for unlabeled examples), otherwise use current_demos
@@ -207,7 +207,7 @@ async def predict_label(example_uid, current_demos, config=C, verbose=False, all
             global reasoning_log
             # reasoning_log += f"\n\n## Candidate:\n{target_prompt}\n## Set:\n"
             #@ TODO record iter
-            labeled = [v for v in current_demos.values() if v['label'] is not None]
+            labeled = [v for v in current_demos.values() if v['pred_label'] is not None]
             reasoning_log += f"""
 Reasoning for UID {example_uid}, labelled {len(labeled)}:
 {response['choices'][0]['message']['content']}\n\n
@@ -234,7 +234,7 @@ Reasoning for UID {example_uid}, labelled {len(labeled)}:
 # %% [code]
 # Compute energy and metrics
 def compute_energy(demos, config=C):
-    labeled = [d for d in demos.values() if d['label'] is not None]
+    labeled = [d for d in demos.values() if d['pred_label'] is not None]
     if not labeled:
         return 0.0
     avg_lprob =  np.mean([d['score'] for d in labeled])
@@ -245,11 +245,11 @@ def compute_energy(demos, config=C):
     num_inconsistent = 0
     groups = {}
     for uid, demo in demos.items():
-        if demo['label'] is not None:
+        if demo['pred_label'] is not None:
             cid = demo['consistency_id']
             if cid not in groups:
                 groups[cid] = []
-            groups[cid].append((uid, demo['label'], demo['consistency_key']))
+            groups[cid].append((uid, demo['pred_label'], demo['consistency_key']))
     
     for cid, items in groups.items():
         key_groups = {}
@@ -269,7 +269,7 @@ def compute_energy(demos, config=C):
             num_inconsistent += max(0, len(items) - len(set(all_labels)))
     
     energy = config.alpha * avg_lprob - num_inconsistent - (num_inconsistent / max(1, len(labeled)))  # Normalized penalty
-    accuracy = np.mean([d['label'] == d['vanilla_label'] for d in labeled])
+    accuracy = np.mean([d['pred_label'] == d['vanilla_label'] for d in labeled])
     # flip acc if needed, as this is unsupervised
     if accuracy < 0.5:
         accuracy = 1 - accuracy
@@ -289,11 +289,11 @@ def get_kflip_neighbors(group_uids, demos, k):
     Generate all label assignments that are k flips away from current.
     Returns list of [(uid, new_label), ...] tuples.
     """
-    labeled_uids = [uid for uid in group_uids if demos[uid]['label'] is not None]
+    labeled_uids = [uid for uid in group_uids if demos[uid]['pred_label'] is not None]
     neighbors = []
     
     for combo in combinations(labeled_uids, k):
-        flips = [(uid, 1 - demos[uid]['label']) for uid in combo]
+        flips = [(uid, 1 - demos[uid]['pred_label']) for uid in combo]
         neighbors.append(flips)
     
     return neighbors
@@ -307,7 +307,7 @@ async def fix_inconsistencies_greedy(demos, config=C, max_fixes=20, max_flips=3,
         # Find inconsistent groups
         groups = {}
         for uid, demo in demos.items():
-            if demo['label'] is not None:
+            if demo['pred_label'] is not None:
                 groups.setdefault(demo['consistency_id'], []).append(uid)
         
         # Find first inconsistent group
@@ -332,7 +332,7 @@ async def fix_inconsistencies_greedy(demos, config=C, max_fixes=20, max_flips=3,
                 # Apply flips temporarily
                 temp_demos = deepcopy(demos)
                 for uid, new_label in flips:
-                    temp_demos[uid]['label'] = new_label
+                    temp_demos[uid]['pred_label'] = new_label
                 
                 # Check if this is consistent
                 if not is_consistent(inconsistent_group, temp_demos):
@@ -351,7 +351,7 @@ async def fix_inconsistencies_greedy(demos, config=C, max_fixes=20, max_flips=3,
         # Apply best flips if improvement found
         if best_flips and best_energy > old_energy:
             for uid, new_label in best_flips:
-                demos[uid]['label'] = new_label
+                demos[uid]['pred_label'] = new_label
         else:
             break  # No improvement possible, stop trying
     
@@ -366,7 +366,7 @@ async def run_icm(demonstrations, config=C):
     # Fix any initial inconsistencies from random initialization
     demonstrations = await fix_inconsistencies_greedy(demonstrations, config)
     
-    current_labeled = {k: v for k, v in demonstrations.items() if v['label'] is not None}
+    current_labeled = {k: v for k, v in demonstrations.items() if v['pred_label'] is not None}
     old_energy, old_metrics = compute_energy(demonstrations, config)
     
     try:
@@ -387,7 +387,7 @@ async def run_icm(demonstrations, config=C):
             weights = [0.1 for _ in all_uids]  # Base low
             
             for cid, group_uids in groups.items():
-                labeled_labels = [demonstrations[uid]['label'] for uid in group_uids if demonstrations[uid]['label'] is not None]
+                labeled_labels = [demonstrations[uid]['pred_label'] for uid in group_uids if demonstrations[uid]['pred_label'] is not None]
                 num_labeled = len(labeled_labels)
                 num_unlabeled = len(group_uids) - num_labeled
                 
@@ -399,7 +399,7 @@ async def run_icm(demonstrations, config=C):
                 if num_unlabeled > 0:
                     weight_factor = (0.5 + 0.5 * inconsistency) * (1 + num_unlabeled / len(group_uids))
                     for uid in group_uids:
-                        if demonstrations[uid]['label'] is None:  # Unlabeled
+                        if demonstrations[uid]['pred_label'] is None:  # Unlabeled
                             idx = all_uids.index(uid)
                             weights[idx] = weight_factor
                 else:
@@ -432,11 +432,11 @@ async def run_icm(demonstrations, config=C):
             
             for uid, (new_label, score) in zip(candidate_uids, results):
                 temp_demos = deepcopy(demonstrations)
-                temp_demos[uid]['label'] = new_label
+                temp_demos[uid]['pred_label'] = new_label
                 temp_demos[uid]['score'] = score
                 
                 # Fix inconsistencies if label changed
-                if demonstrations[uid]['label'] != new_label:
+                if demonstrations[uid]['pred_label'] != new_label:
                     temp_demos = await fix_inconsistencies_greedy(temp_demos, config)
                 
                 new_energy, _ = compute_energy(temp_demos, config)
@@ -460,7 +460,7 @@ async def run_icm(demonstrations, config=C):
             if delta > 0 or random.random() < math.exp(delta / T):
                 demonstrations = best_temp_demos
                 old_energy = new_energy
-                current_labeled = {k: v for k, v in demonstrations.items() if v['label'] is not None}
+                current_labeled = {k: v for k, v in demonstrations.items() if v['pred_label'] is not None}
                 logger.debug("Iter {}: Accepted UID {}. Energy: {:.2f}. {}", iter, best_uid, old_energy, accept_msg)
             else:
                 logger.debug("Iter {}: Rejected. {}", iter, accept_msg)
@@ -502,14 +502,14 @@ logger.info("Inconsistencies: {}", final_metrics['num_inconsistent'])
 df = pd.DataFrame(final_demos).T
 df.to_parquet(out_dir / "icm_final_labels.parquet")
 
-df_labeled = df.dropna(subset='label').sort_values(by='score', key=np.abs, ascending=False)
-df_labeled_disagreed = df_labeled[df_labeled['vanilla_label'] != df_labeled['label']]
+df_labeled = df.dropna(subset='pred_label').sort_values(by='score', key=np.abs, ascending=False)
+df_labeled_disagreed = df_labeled[df_labeled['vanilla_label'] != df_labeled['pred_label']]
 
 print(f"\nFinal labeled examples (total {len(df_labeled)}):")
-print(df_labeled_disagreed[['consistency_id', 'label', 'vanilla_label', 'score', 'prompt']])
+print(df_labeled_disagreed[['consistency_id', 'pred_label', 'vanilla_label', 'score', 'prompt']])
 
 for uid, row in df_labeled_disagreed.iterrows():
-    print(f"\n## Candidate: {row['prompt']}\nICM Set: {'A' if row['label']==1 else 'B'}, Vanilla Set: {'A' if row['vanilla_label']==1 else 'B'}, score={row['score']}\n")
+    print(f"\n## Candidate: {row['prompt']}\nICM Set: {'A' if row['pred_label']==1 else 'B'}, Vanilla Set: {'A' if row['vanilla_label']==1 else 'B'}, score={row['score']}\n")
 
 print(f"\nFinal labeled examples saved to {out_dir / 'icm_final_labels.parquet'}")
 
