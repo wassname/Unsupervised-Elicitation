@@ -10,7 +10,7 @@ def is_consistent(group_uids, demos):
     
     # Get labeled items only
     labeled = [(uid, demos[uid]['label'], demos[uid]['consistency_key']) 
-               for uid in group_uids if demos[uid]['label'] is not None]
+               for uid in group_uids if demos[uid].get('label', None) is not None]
     
     if len(labeled) < 2:
         return True  # Can't be inconsistent with <2 labels

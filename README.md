@@ -26,7 +26,7 @@ Usage
 ```py
 # make sure you OPENROUTER_API_KEY is set in your .env file
 uv sync
-uv run nbs/simple_icm.py
+uv run src/simple_icm.py
 ```
 
 ## Results

@@ -19,7 +19,7 @@ from dataclasses import dataclass, asdict
 import dotenv
 from loguru import logger
 from openrouter_wrapper.logprobs import openrouter_completion_wlogprobs, get_logprobs_choices, LogprobsNotSupportedError  # User's wrapper
-from typing import List, Optional, Tuple, Callable, Literal
+from typing import List, Optional, Tuple, Callable, Literal, Any
 import asyncio
 from aiocache import cached
 from itertools import combinations
@@ -77,6 +77,15 @@ class Config:
     provider_whitelist: Tuple[str] = ('Chutes','Nebius',)  # None to let OpenRouter choose
 
     out_dir: Path = Path("./outputs/icm")  # Directory to save outputs
+
+
+@dataclass
+class PredictionLog:
+    uid: str
+    target: int
+    score: float
+    pred_label: bool
+    context: List[List[Any]]
 
 
 import simple_parsing
@@ -140,6 +149,13 @@ logger.info("Initialized labels: {}", {k: v['pred_label'] for k, v in demonstrat
 
 # %% [code]
 # Predict label using in-context prompting
+@dataclass
+class PredictionLog:
+    uid: str
+    target: int
+    score: float
+    pred_label: bool
+    context: List[List[PredictionLog]]
 
 def print_messages(messages):
     return "\n".join([f"**{m['role'].upper()}**: {m['content']}" for m in messages])
@@ -224,11 +240,15 @@ Reasoning for UID {example_uid}, labelled {len(labeled)}:
             logger.warning(f"Choices not returned for UID {example_uid}, may indicate model confusion. choice_logp={choice_logp}. Instead we got these top logprobs: {top_logp} and \nmessages: ...`{print_messages(messages)[-90:]}`\nthis output:`{model_response}`")
         score = choice_logp["A"] - choice_logp["B"]
         predicted = 1 if score > 0 else 0
-        return predicted, float(score)
+
+        context = [PredictionLog(uid=demo['uid'], target=demo['prompt'], score=demo['score'], pred_label=demo['pred_label'], context=[]) for demo in relevant_demos]
+        pred_log = PredictionLog(uid=example_uid, target=predicted, score=float(score), pred_label=bool(predicted), context=context)
+
+        return predicted, float(score), pred_log
     except Exception as e:
         raise e
         logger.exception(f"API error: {e}")
-        return random.choice([0, 1]), 0.0
+        return random.choice([0, 1]), 0.0, None
 
 
 # %% [code]
@@ -424,13 +444,19 @@ async def run_icm(demonstrations, config=C):
             tasks = [predict_label(uid, current_labeled, config, verbose=verbose, all_demos=demonstrations) 
                      for uid in candidate_uids]
             results = await asyncio.gather(*tasks)
+
+            with open(out_dir / "predictions.jsonl", "a") as f:
+                for _, _, pred_log in results:
+                    if pred_log is not None:
+                        json.dump(asdict(pred_log), f)
+                        f.write('\n')
             
             # Evaluate each candidate's energy delta
             best_uid = None
             best_delta = float('-inf')
             best_temp_demos = None
             
-            for uid, (new_label, score) in zip(candidate_uids, results):
+            for uid, (new_label, score, _) in zip(candidate_uids, results):
                 temp_demos = deepcopy(demonstrations)
                 temp_demos[uid]['pred_label'] = new_label
                 temp_demos[uid]['score'] = score
@@ -475,6 +501,8 @@ async def run_icm(demonstrations, config=C):
         logger.info("Stopping early.")
     except asyncio.CancelledError:
         logger.info("Asyncio task cancelled.")
+
+
     
     return demonstrations, energies, accuracies
 
@@ -482,7 +510,7 @@ async def run_icm(demonstrations, config=C):
 # Run the algorithm
 try:
     final_demos, energies, accuracies = asyncio.run(run_icm(demonstrations, C))
-except Exception as e:
+except (asyncio.CancelledError, KeyboardInterrupt) as e:
     logger.exception(f"Error during ICM run: {e}")
     final_demos = demonstrations
     energies = []
@@ -502,6 +530,7 @@ logger.info("Inconsistencies: {}", final_metrics['num_inconsistent'])
 df = pd.DataFrame(final_demos).T
 df.to_parquet(out_dir / "icm_final_labels.parquet")
 
+
 df_labeled = df.dropna(subset='pred_label').sort_values(by='score', key=np.abs, ascending=False)
 df_labeled_disagreed = df_labeled[df_labeled['vanilla_label'] != df_labeled['pred_label']]
 
@@ -512,6 +541,7 @@ for uid, row in df_labeled_disagreed.iterrows():
     print(f"\n## Candidate: {row['prompt']}\nICM Set: {'A' if row['pred_label']==1 else 'B'}, Vanilla Set: {'A' if row['vanilla_label']==1 else 'B'}, score={row['score']}\n")
 
 print(f"\nFinal labeled examples saved to {out_dir / 'icm_final_labels.parquet'}")
+print(f"Predictions log saved to {out_dir / 'predictions.jsonl'}")
 
 # %% [code]
 # Simple visualization (requires matplotlib)
