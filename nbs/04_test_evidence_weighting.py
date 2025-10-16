@@ -47,7 +47,7 @@ for item in data:
 
 
 # Pick an abritrary group with at least 10 examples
-GROUP_SIZE = 12
+GROUP_SIZE = 22
 test_group = []
 for gid, items in groups.items():
     test_group += items
@@ -211,39 +211,41 @@ def calculate_evidence_from_predictions(
 
             evidence[key]["count"] += 1
 
-    # Average accumulated values
+    # Average accumulated values (only those that were summed)
     for key, ev in evidence.items():
         count = ev["count"]
         if count > 0:
             ev["flip_delta"] /= count
             ev["flip_sensitivity"] /= count
             ev["direct_confidence"] /= count
-            ev["mutual_predictability"] /= count
+            # mutual_predictability is already set (not accumulated)
 
     return dict(evidence)
 
 
 def compute_total_weight(ev: Dict[str, float]) -> float:
     """
-    Compute evidence strength for label validation.
-    Positive flip_delta + high sensitivity = flip was beneficial.
+    Compute evidence strength for label validation (DISPLAY ONLY - not used in grid search).
+    
+    Note: Returns normalized score for interpretability. Actual weighting uses z-scored features.
     """
-    # Gate: only trust if source has decent confidence (>0.6 in prob space ≈ >0.4 logprob)
-    conf_gate = lpr2prob(ev["direct_confidence"]) > 0.6
+    # Gate: only trust if source has decent confidence (raw logprobs are ~±960 scale)
+    conf_gate = ev["direct_confidence"] > 0  # Positive = favors A over B
     
     if not conf_gate:
-        return 0.0  # Don't trust low-confidence sources
+        return 0.0
     
-    # Directional evidence: positive flip_delta = flip improved coherence
-    flip_contrib = ev["flip_delta"] * ev["flip_sensitivity"]  # signed strength
+    # Normalize features for display (same as grid search preprocessing)
+    flip_contrib = ev["flip_delta"] * ev["flip_sensitivity"]
+    inv_var = 1 / (1 + ev["ensemble_variance"])
     
-    # Weighted combination (tune empirically)
+    # Simple weighted sum with normalization for ~960 logprob scale
     total = (
-        0.4 * flip_contrib  # Main signal: directional flip evidence
-        + 0.2 * abs(ev["direct_confidence"])  # Source confidence
-        + 0.2 * (1 / (1 + ev["ensemble_variance"]))  # Low var = good
-        + 0.1 * ev["mutual_predictability"]
-        + 0.1 * ev["consistency_score"]
+        0.1 * np.tanh(flip_contrib / 100)  # Squash large values
+        + 0.3 * np.tanh(ev["direct_confidence"] / 500)  # Normalize ~960 scale
+        + 0.1 * inv_var  # Already 0-1 range
+        + 0.4 * ev["mutual_predictability"]  # Already normalized
+        + 0.1 * ev["consistency_score"]  # 0 or 1
     )
     return total
 
@@ -538,12 +540,16 @@ def evaluate_weights(
     w_var: float,
     w_mp: float,
     w_cons: float,
+    metric: str = "accuracy",  # "accuracy" or "brier"
 ) -> Dict[str, float]:
     """
     Evaluate evidence weights by aggregating predictions in LOGPROB space.
     
     Core idea: Weight each prediction's logprob by the reliability of its context sources.
     Then aggregate via weighted mean in logprob space -> convert to label.
+    
+    Args:
+        metric: "accuracy" for hard decisions (ICM acceptance), "brier" for calibration (energy terms)
     """
     # Group predictions by target
     target_predictions = defaultdict(list)
@@ -633,22 +639,31 @@ def evaluate_weights(
             correct += 1
         total += 1
 
-        # Calibration error
-        calibration_errors.append(abs(final_prob - true_label))
+        # Calibration metrics
+        calibration_errors.append(abs(final_prob - true_label))  # MAE
+        brier_score = (final_prob - true_label) ** 2  # Brier (MSE of probs)
 
     accuracy = correct / total if total > 0 else 0.0
     avg_calibration_error = np.mean(calibration_errors) if calibration_errors else 1.0
+    brier = np.mean([(lpr2prob(final_logprob) - ex["vanilla_label"]) ** 2 
+                     for ex in test_group if ex["uid"] in target_predictions]) if total > 0 else 1.0
+
+    # Primary metric for sorting
+    primary_metric = accuracy if metric == "accuracy" else (1 - brier)  # Higher is better
 
     return {
         "accuracy": accuracy,
         "calibration_error": avg_calibration_error,
+        "brier_score": brier,
+        "primary_metric": primary_metric,
         "correct": correct,
         "total": total,
     }
 
 
 # Grid search (coarse)
-best_acc = 0.0
+METRIC = "brier"  # "accuracy" for hard decisions, "brier" for calibration (better for energy terms)
+best_primary = 0.0
 best_calibration = 1.0
 best_weights = None
 best_metrics = None
@@ -675,12 +690,11 @@ data = []
 for weights in tqdm(weight_grid):
     w_flip, w_conf, w_var, w_mp, w_cons = weights
     metrics = evaluate_weights(
-        predictions, evidence_dict, test_group, w_flip, w_conf, w_var, w_mp, w_cons
+        predictions, evidence_dict, test_group, w_flip, w_conf, w_var, w_mp, w_cons, metric=METRIC
     )
 
-
-    if (metrics["accuracy"] >= best_acc) and (metrics["calibration_error"] < best_calibration):
-        best_acc = metrics["accuracy"]
+    if (metrics["primary_metric"] >= best_primary) and (metrics["calibration_error"] < best_calibration):
+        best_primary = metrics["primary_metric"]
         best_calibration = metrics["calibration_error"]
         best_weights = weights
         best_metrics = metrics
@@ -688,13 +702,18 @@ for weights in tqdm(weight_grid):
     data.append({
         "weights": weights,
         "accuracy": metrics["accuracy"],
+        "brier_score": metrics["brier_score"],
         "calibration_error": metrics["calibration_error"],
+        "primary_metric": metrics["primary_metric"],
         "correct": metrics["correct"],
         "total": metrics["total"],
     })
 
-df_results = pd.DataFrame(data).sort_values(by=["accuracy", "calibration_error"], ascending=[False, True])
+df_results = pd.DataFrame(data).sort_values(
+    by=["primary_metric", "calibration_error"], ascending=[False, True]
+)
 print("\n=== Sorted Grid Search Results ===")
+print(f"Metric: {METRIC} ({'1-brier' if METRIC == 'brier' else 'accuracy'})")
 print(df_results.head(30))
 
 s_top_weights = pd.DataFrame(np.stack(df_results.head(30).weights.values), columns=['flip_contrib', 'conf', 'var', 'mp', 'cons']).mean().sort_values()
@@ -703,7 +722,11 @@ print(s_top_weights)
 
 # TODO label best weights with df_evidence.columns
 print(
-    f"\nBest weights: {best_weights} -> acc={best_acc:.3f}, cal_err={best_metrics['calibration_error']:.3f}"
+    f"\nBest weights: {best_weights} -> "
+    f"primary={best_primary:.3f} ({METRIC}), "
+    f"acc={best_metrics['accuracy']:.3f}, "
+    f"brier={best_metrics['brier_score']:.3f}, "
+    f"cal_err={best_metrics['calibration_error']:.3f}"
 )
 
 # %% [code]
