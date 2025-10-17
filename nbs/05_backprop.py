@@ -34,7 +34,7 @@ data[0]
 # %%
 
 # Save predictions as JSONL
-output_path = Path("outputs/icm/evidence_test_predictions.jsonl")
+output_path = Path("outputs/icm/truthfulqa/predictions.jsonl")
 preds = list(srsly.read_jsonl(output_path))
 df_preds = pd.DataFrame(preds)
 preds[0]
@@ -46,10 +46,10 @@ output_path = Path("./outputs/icm/truthfulqa/icm_final_labels.parquet")
 df_preds = pd.read_parquet(output_path)
 df_preds
 
-# {'target_uid': 20,
+# {'uid': 20,
 #  'target_idx': 20,
 #  'score': 0.9999999999991981,
-#  'raw_logprob_diff': 27.85156273937173,
+#  'score': 27.85156273937173,
 #  'context': [{'uid': 3,
 #    'label': 0,
 #    'raw_logprob': 962.109375,
@@ -71,18 +71,19 @@ unique_uids = sorted(df_data.index.tolist())
 num_labels = len(unique_uids)
 uid_to_idx = {uid: idx for idx, uid in enumerate(unique_uids)}
 
-# Compute priors: avg raw_logprob_diff per target_uid
+# Compute priors: avg score per uid
 priors_diff = defaultdict(list)
 for pred in preds:
-    target_uid = pred['target_uid']
-    diff = pred['raw_logprob_diff']
-    priors_diff[target_uid].append(diff)
+    uid = pred['uid']
+    diff = pred['score']
+    priors_diff[uid].append(diff)
 
 # Average diffs, default to 0 if no preds
 # FIXME should we say mean /std
-avg_diffs = {uid: np.mean(priors_diff.get(uid, [0.0])) / (1+np.std(priors_diff.get(uid, [1.0]))) for uid in unique_uids}
-scale = 10.0  # Normalize large logprobs
-prior_logits = torch.tensor([[ -d / scale, d / scale ] for d in avg_diffs.values()])  # [logit_0, logit_1]
+diffs = {uid: torch.tensor(priors_diff.get(uid, [0.0, 0.0])) for uid in unique_uids}
+std_diffs = {uid: torch.std(v) if ((len(v)>1) and (torch.norm(v)>0)) else torch.tensor(0.0) for uid, v in diffs.items()}
+norm_diffs = {uid: diffs[uid].mean() / (1.0 + std_diffs[uid]) for uid in unique_uids}
+prior_logits = torch.tensor([[ -d / 2, d / 2 ] for d in norm_diffs.values()])  # [logit_0, logit_1]
 # priors = F.softmax(prior_logits, dim=1)  # Soft priors [num_labels, 2]
 
 priors = prior_logits
@@ -92,12 +93,11 @@ tuples = []
 for pred in preds:  # Subsample
     context_uids = [c['uid'] for c in pred['context']]
     valid_context = [u for u in context_uids if u in uid_to_idx]  # Filter valid
-    if len(valid_context) > 0 and pred['target_uid'] in uid_to_idx:
+    if len(valid_context) > 0 and pred['uid'] in uid_to_idx:
         tuples.append({
             'context_uids': valid_context,
-            'target_uid': pred['target_uid'],
-            'llm_pred_diff': pred['raw_logprob_diff'],
-            'llm_pred_score': pred['score']  # Proxy for prob_1
+            'uid': pred['uid'],
+            'llm_pred_diff': pred['score'],
         })
 
 # Join with original data for consistency_id (add to tuples or separate)
@@ -153,10 +153,10 @@ def coherence_loss(labels, tuples, priors, consistency_groups, uid_to_idx, loss_
     # No extra deps; use loop-based aggregation for small num_labels (~800)
     num_nodes = soft_labels.shape[0]
     weighted_context = torch.zeros_like(soft_labels)  # [num_nodes, 2]
-    degrees = torch.zeros(num_nodes)  # For normalization
+    degrees = torch.zeros(num_nodes).to(soft_labels.device)  # For normalization
     
     for t in tuples:
-        target_idx = uid_to_idx[t['target_uid']]
+        target_idx = uid_to_idx[t['uid']]
         context_indices = torch.tensor([uid_to_idx[u] for u in t['context_uids']])
         if len(context_indices) == 0:
             continue
@@ -179,7 +179,7 @@ def coherence_loss(labels, tuples, priors, consistency_groups, uid_to_idx, loss_
     # Updated Mutual: Use weighted_context for CE
     mutual_loss = 0.0
     for t in tuples:
-        target_idx = uid_to_idx[t['target_uid']]
+        target_idx = uid_to_idx[t['uid']]
         if degrees[target_idx] == 0:
             continue
         context_agg = weighted_context[target_idx]
@@ -197,7 +197,7 @@ def coherence_loss(labels, tuples, priors, consistency_groups, uid_to_idx, loss_
     # Simple English: "The LLM ranked 'yes' higher than 'no' for this example—make sure your learned label agrees on which is stronger, with a safety margin to avoid ties. Like forcing your guesses to match the model's confidence order, not exact numbers."
     ranking_loss = 0.0
     for t in tuples:
-        target_idx = uid_to_idx[t['target_uid']]
+        target_idx = uid_to_idx[t['uid']]
         llm_diff = t['llm_pred_diff'] / scale
         score1 = soft_labels[target_idx, 1]  # Prob 1
         score2 = soft_labels[target_idx, 0]  # Prob 0
@@ -211,7 +211,7 @@ def coherence_loss(labels, tuples, priors, consistency_groups, uid_to_idx, loss_
     # Prior KL: Pull toward priors
     # Intuition: Anchor learned labels to fixed LLM priors (averaged logprob diffs) via KL on logits to prevent drift from model's initial biases.
     # Simple English: "Don't stray too far from the model's original hunches (its logprob biases for each example). Pull labels back toward these starting points gently, like a rubber band keeping you grounded in what the model already 'knows'."
-    prior_loss = F.kl_div(F.log_softmax(labels, dim=1), priors, reduction='batchmean')
+    prior_loss = F.kl_div(F.log_softmax(labels, dim=1), F.softmax(priors, dim=1), reduction='batchmean')
     terms['prior'] = prior_loss 
     
     # Direct Consistency: Penalize variance within consistency groups
@@ -232,7 +232,7 @@ def coherence_loss(labels, tuples, priors, consistency_groups, uid_to_idx, loss_
     # Simple English: "Make labels decisive (mostly yes or no, not 50/50 unsure). For each target, calculate how 'spread out' its probability is and add a small penalty if it's too wishy-washy—pushes toward bold, consistent choices that build confidence across predictions."
     entropy_loss = 0.0
     for t in tuples:
-        target_idx = uid_to_idx[t['target_uid']]
+        target_idx = uid_to_idx[t['uid']]
         target_soft = soft_labels[target_idx]
         entropy = -(target_soft * torch.log(target_soft + 1e-8)).sum()
         entropy_loss += entropy
@@ -241,7 +241,7 @@ def coherence_loss(labels, tuples, priors, consistency_groups, uid_to_idx, loss_
     # New: Reward context for good evidence
     reward_loss = 0.0
     for t in tuples:
-        target_idx = uid_to_idx[t['target_uid']]
+        target_idx = uid_to_idx[t['uid']]
         context_indices = torch.tensor([uid_to_idx[u] for u in t['context_uids']])
         if len(context_indices) == 0:
             continue
@@ -262,7 +262,8 @@ def coherence_loss(labels, tuples, priors, consistency_groups, uid_to_idx, loss_
     # For hacking: print terms
     if torch.is_grad_enabled() and verbose:
         print(f"Loss terms: { {k: v.item() if hasattr(v, 'item') else v for k,v in terms.items()} }")
-    
+
+    assert torch.isfinite(total_loss), "Loss is NaN or Inf"
     return total_loss
 
 # Test with dummy
@@ -270,24 +271,31 @@ dummy_loss = coherence_loss(labels, tuples[:1], priors, consistency_groups, uid_
 print(f"Sample loss: {dummy_loss.item()}")
 # %% [code]
 
-def run_backprop_experiment(labels, tuples, priors, consistency_groups, uid_to_idx, loss_weights, df_data, df_preds, unique_uids, avg_diffs):
+def run_backprop_experiment(labels, tuples, priors, consistency_groups, uid_to_idx, loss_weights, df_data, df_preds, unique_uids, 
+                            prior_logits,
+                            device='cuda',
+                            ):
     """
     Run backprop experiment with given weights, return metrics.
     """
     # Copy labels
-    current_labels = labels.clone().detach().requires_grad_(True)
+    current_labels = labels.clone().detach().to(device).requires_grad_(True)
+
+    priors = priors.to(device)
     
-    # optimizer = optim.LBFGS([current_labels], lr=0.1, max_iter=20)
-    optimizer = optim.AdamW([current_labels], lr=0.1)
+    optimizer = optim.LBFGS([current_labels], lr=0.1, max_iter=20)
+    # optimizer = optim.AdamW([current_labels], lr=0.1)
     losses = []
     epochs = 10
-    
+
     for epoch in tqdm(range(epochs), desc="Optimizing"):
         def closure():
             optimizer.zero_grad()
             loss = coherence_loss(current_labels, tuples, priors, consistency_groups, uid_to_idx, loss_weights, verbose=False)
             loss.backward()
             return loss
+        
+        assert torch.isfinite(current_labels).all(), "Labels contain NaN or Inf"
         loss_val = optimizer.step(closure)
         losses.append(loss_val.item())
     
@@ -304,7 +312,7 @@ def run_backprop_experiment(labels, tuples, priors, consistency_groups, uid_to_i
         row['learned_soft_0'] = float(final_soft[idx, 0].detach())
         row['learned_soft_1'] = float(final_soft[idx, 1].detach())
         row['learned_hard'] = int(final_hard[idx])
-        row['prior_diff'] = avg_diffs.get(uid, 0.0)
+        # row['prior_diff'] = avg_diffs.get(uid, 0.0)
         output_data.append(row)
     
     df_output = pd.DataFrame(output_data)
@@ -312,12 +320,10 @@ def run_backprop_experiment(labels, tuples, priors, consistency_groups, uid_to_i
     
     # LLM acc
     llm_acc = 0.0
-    if not df_preds.empty and 'target_uid' in df_preds.columns and 'vanilla_label' in df_data.columns:
+    if not df_preds.empty and 'uid' in df_preds.columns and 'vanilla_label' in df_data.columns:
         df_preds_local = df_preds.copy()
-        df_preds_local['hard_llm_pred'] = (df_preds_local['raw_logprob_diff'] > 0).astype(int)
-        common_preds = df_preds_local.merge(df_data.reset_index()[['uid', 'vanilla_label']], left_on='target_uid', right_on='uid', how='inner')
-        if not common_preds.empty:
-            llm_acc = (common_preds['hard_llm_pred'] == common_preds['vanilla_label']).mean()
+        df_preds_local['hard_llm_pred'] = (df_preds_local['score'] > 0).astype(int)
+        llm_acc = (df_preds_local['hard_llm_pred'] == df_preds_local['vanilla_label']).mean()
     
     # ICM corr
     icm_corr = 0.0
@@ -344,6 +350,7 @@ def run_backprop_experiment(labels, tuples, priors, consistency_groups, uid_to_i
 
 # Experiment with loss weights: Loop over variations, print key results
 
+# FIXME this is only varying mutual weight, but should vary others too
 # Baseline weights
 base_weights = {
     'mutual': 1.0,
@@ -354,14 +361,19 @@ base_weights = {
     'reward': 0.2
 }
 
+import matplotlib.pyplot as plt
+
 # Example: Vary mutual weight (one at a time, as suggested)
 mutual_variations = [0.1, 0.5, 1.0, 2.0]
 results = {}
 
-for mw in mutual_variations:
+for k in base_weights:
     weights = base_weights.copy()
-    weights['mutual'] = mw
-    print(f"\n--- Testing mutual_weight = {mw} ---")
-    res = run_backprop_experiment(labels, tuples, priors, consistency_groups, uid_to_idx, weights, df_data, df_preds, unique_uids, avg_diffs)
-    results[mw] = res
-    print(f"Mutual {mw}: Acc {res['acc']:.4f}, ICM Corr {res['icm_corr']:.4f}, Final Loss {res['final_loss']:.4f}, LLM Acc {res['llm_acc']:.4f}")
+    weights = {k:0 for k in weights}  # Zero all
+    weights[k] = 1
+    print(f"\n--- Testing {k} = {weights[k]} ---")
+    res = run_backprop_experiment(labels, tuples, priors, consistency_groups, uid_to_idx, weights, df_data, df_preds, unique_uids, diffs)
+    results[k] = res
+    plt.plot(res['final_loss'])
+    plt.savefig(f"outputs/backprop/loss_{k}.png")
+    print(f"{k}: Acc {res['acc']:.4f}, ICM Corr {res['icm_corr']:.4f}, Final Loss {res['final_loss']:.4f}, LLM Acc {res['llm_acc']:.4f}")

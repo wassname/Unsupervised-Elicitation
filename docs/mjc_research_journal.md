@@ -344,3 +344,42 @@ Theory clarification (in Analysis section):
 We can take `nbs/05_backprop.py` which loads `Path("outputs/icm/evidence_test_predictions.jsonl")` which are the LLM predictions over TruthfulQA. Now we can keep it simple, and keep the loss function flexible and hackable (without being defensive about expections ,we can fix them instead of worry about them).
 
 So first lets plan, if you took at `nbs/05_backprop.py` you see it loads the LLM predictions, and then creates a `tuples` list of dicts with keys. Could you strip out what we don't need, and instead add this pytorch backprop idea, with multiple things wighted in the loss functions? How would you do it, high level?
+
+
+# 2025-10-17 08:02:59
+
+    /media/wassname/SGIronWolf/projects5/2025/Unsupervised-Elicitation backprop* ⇡ 47m 10s
+    .venv ❯ uv run nbs/05_backprop.py
+    Num labels: 1580, Num tuples: 31546
+    Sample prior: tensor([ 0.8857, -0.8857])
+    Sample tuple: {'context_uids': [43, 100, 135, 229, 234, 248], 'uid': 1344, 'llm_pred_diff': -4.999999865889549}
+    Labels shape: torch.Size([1580, 2])
+    Loss weights: {'mutual': 1.0, 'ranking': 0.5, 'prior': 0.1, 'direct': 0.5, 'entropy': 0.1}
+    Sample loss: nan
+
+    --- Testing mutual = 1 ---
+    Optimizing: 100%|█████████████████████████████████████████| 10/10 [11:40<00:00, 70.02s/it]
+    mutual: Acc 0.5076, ICM Corr 0.0000, Final Loss nan, LLM Acc 0.8196
+
+    --- Testing ranking = 1 ---
+    Optimizing: 100%|█████████████████████████████████████████| 10/10 [11:07<00:00, 66.75s/it]
+    ranking: Acc 0.7785, ICM Corr 0.0000, Final Loss nan, LLM Acc 0.8196
+
+    --- Testing prior = 1 ---
+    Optimizing: 100%|█████████████████████████████████████████| 10/10 [10:58<00:00, 65.88s/it]
+    prior: Acc 0.7854, ICM Corr 0.0000, Final Loss nan, LLM Acc 0.8196
+
+    --- Testing direct = 1 ---
+    Optimizing: 100%|█████████████████████████████████████████| 10/10 [10:56<00:00, 65.60s/it]
+    direct: Acc 0.4544, ICM Corr 0.0000, Final Loss nan, LLM Acc 0.8196
+
+    --- Testing entropy = 1 ---
+    Optimizing: 100%|█████████████████████████████████████████| 10/10 [10:58<00:00, 65.90s/it]
+    entropy: Acc 0.7854, ICM Corr 0.0000, Final Loss nan, LLM Acc 0.8196
+
+    --- Testing reward = 1 ---
+    Optimizing: 100%|█████████████████████████████████████████| 10/10 [10:10<00:00, 61.05s/it]
+    reward: Acc 0.7753, ICM Corr 0.0000, Final Loss nan, LLM Acc 0.8196
+
+
+Q: why is it so flow when it's not much data? It 10 epochs enougth when the final loss is nan?
